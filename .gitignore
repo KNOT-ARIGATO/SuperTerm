@@ -1,0 +1,23 @@
+# build output
+dist/
+build_tmp/
+build/
+*.spec
+__pycache__/
+*.pyc
+
+# user data / secrets — never commit
+ssh_passwords.json
+quick_commands.json
+quick_commands_by_protocol.json
+theme.json
+*.corrupt
+crash.log
+selftest.txt
+update_error.txt
+
+# editor / OS
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

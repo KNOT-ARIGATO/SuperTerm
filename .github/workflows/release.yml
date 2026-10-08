@@ -1,0 +1,65 @@
+# Push a tag like v1.1.0  →  GitHub builds SuperTerm.exe on Windows,
+# runs its self-test and publishes it (plus a SHA-256 file) as a Release.
+# The built-in updater of SuperTerm downloads exactly these two files.
+name: Build & release SuperTerm
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:          # manual run = build only (artifact), no release
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Tag must match APP_VERSION
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $v = (Select-String -Path app.py -Pattern '^APP_VERSION = "(.+)"').Matches[0].Groups[1].Value
+          if ("v$v" -ne "${{ github.ref_name }}") { throw "APP_VERSION is $v but the tag is ${{ github.ref_name }}" }
+
+      - name: Install
+        run: python -m pip install -r requirements-build.txt
+
+      - name: Build SuperTerm.exe
+        shell: pwsh
+        run: ./build.ps1
+
+      - name: Self-test the exe
+        shell: pwsh
+        run: |
+          $p = Start-Process dist/SuperTerm.exe -ArgumentList "--selftest" -PassThru -Wait
+          Get-Content "$env:APPDATA/SuperTerm/selftest.txt"
+          if ($p.ExitCode -ne 0) { throw "self-test failed" }
+
+      - name: Checksum
+        shell: pwsh
+        run: |
+          $h = (Get-FileHash dist/SuperTerm.exe -Algorithm SHA256).Hash.ToLower()
+          "$h  SuperTerm.exe" | Out-File -Encoding ascii dist/SuperTerm.exe.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SuperTerm
+          path: |
+            dist/SuperTerm.exe
+            dist/SuperTerm.exe.sha256
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/SuperTerm.exe
+            dist/SuperTerm.exe.sha256
+          generate_release_notes: true
