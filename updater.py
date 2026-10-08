@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -46,11 +47,33 @@ def is_newer(latest, current):
     return parse_version(latest) > parse_version(current)
 
 
+_SSL_CTX = None
+
+
+def _ssl_context():
+    """Windows certificate store + Mozilla's CA bundle (certifi).
+    Windows alone is not enough on some PCs: GitHub's chain ends in a newer
+    root that Windows only fetches on demand, so plain Python fails with
+    CERTIFICATE_VERIFY_FAILED. The Windows store is kept for company proxies
+    that inspect HTTPS with their own root certificate."""
+    global _SSL_CTX
+    if _SSL_CTX is None:
+        ctx = ssl.create_default_context()
+        try:
+            import certifi
+            ctx.load_verify_locations(certifi.where())
+        except (ImportError, OSError, ssl.SSLError):
+            pass
+        _SSL_CTX = ctx
+    return _SSL_CTX
+
+
 def _open(url, timeout):
     req = urllib.request.Request(url, headers={
         "User-Agent": "SuperTerm-updater",
         "Accept": "application/vnd.github+json"})
-    return urllib.request.urlopen(req, timeout=timeout)    # uses the Windows proxy settings
+    # uses the Windows proxy settings automatically
+    return urllib.request.urlopen(req, timeout=timeout, context=_ssl_context())
 
 
 def check_latest(repo=None, timeout=8):

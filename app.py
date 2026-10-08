@@ -34,7 +34,7 @@ MAX_LOG_LINES = 50000
 FLUSH_MS = 40            # log output is batched: one UI update per 40 ms ...
 FLUSH_MAX = 1500         # ... of at most this many lines
 APP_NAME = "SuperTerm"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
 OLD_NAMES = ("SuperTeam", "UartLogViewer")   # earlier names of this app (settings migration)
 
 
@@ -1932,6 +1932,8 @@ def selftest():
                          "assert s.buffer[0][2].data == 'ที่', s.buffer[0][2]"),
                         ("QtMultimedia", "from PySide6.QtMultimedia import QMediaPlayer"),
                         ("QtMultimediaWidgets", "from PySide6.QtMultimediaWidgets import QVideoWidget"),
+                        ("CA bundle (updates)", "import certifi, os; assert os.path.getsize(certifi.where()) > 100000; "
+                                                "import updater; updater._ssl_context()"),
                         ("icon asset", "assert __import__('os').path.exists(resource_path('assets/icon.png'))")):
         try:
             exec(stmt, globals())

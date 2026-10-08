@@ -12,6 +12,7 @@ project links below.
 | wcwidth | MIT | https://github.com/jquast/wcwidth |
 | pyserial | BSD-3-Clause | https://github.com/pyserial/pyserial |
 | paramiko | LGPL-2.1 | https://github.com/paramiko/paramiko |
+| certifi (Mozilla CA bundle) | MPL-2.0 | https://github.com/certifi/python-certifi |
 | PyInstaller bootloader | GPL-2.0 with bootloader exception | https://pyinstaller.org |
 
 The LGPL components are used unmodified as separate libraries. To rebuild
