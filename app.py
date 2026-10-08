@@ -34,7 +34,7 @@ MAX_LOG_LINES = 50000
 FLUSH_MS = 40            # log output is batched: one UI update per 40 ms ...
 FLUSH_MAX = 1500         # ... of at most this many lines
 APP_NAME = "SuperTerm"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 OLD_NAMES = ("SuperTeam", "UartLogViewer")   # earlier names of this app (settings migration)
 
 
@@ -158,22 +158,22 @@ def derive(p):
 
 
 QSS = Template("""
-* { font-family: "Segoe UI", "Leelawadee UI", sans-serif; font-size: 13px; }
+* { font-family: "Segoe UI", "Leelawadee UI", sans-serif; font-size: 12px; }
 QMainWindow, QWidget#root { background: $BG; }
 QWidget { color: $TEXT; }
 QLabel { background: transparent; }
-QLabel#title { font-size: 17px; font-weight: 700; color: $TEXT; }
+QLabel#title { font-size: 15px; font-weight: 700; color: $TEXT; }
 QLabel#subtitle, QLabel#hint, QLabel#field, QLabel#empty { color: $DIM; }
-QLabel#hint { font-size: 11px; }
-QLabel#section { font-weight: 700; color: $DIM; font-size: 11px; letter-spacing: 1px; }
-QLabel#mono { font-family: Consolas, monospace; color: $DIM; font-size: 11px; }
+QLabel#hint { font-size: 10px; }
+QLabel#section { font-weight: 700; color: $DIM; font-size: 10px; letter-spacing: 1px; }
+QLabel#mono { font-family: Consolas, monospace; color: $DIM; font-size: 10px; }
 QLabel#badge { background: $INPUT; color: $DIM; border: 1px solid $BORDER; border-radius: 6px;
-               padding: 1px 8px; font-size: 10px; font-weight: 700; }
+               padding: 1px 7px; font-size: 9px; font-weight: 700; }
 
 QFrame#card { background: $PANEL; border: 1px solid $BORDER; border-radius: 10px; }
 QFrame#header { background: $PANEL; border-bottom: 1px solid $BORDER; }
 
-QLabel#pill { padding: 5px 12px; border-radius: 12px; background: $INPUT; color: $DIM;
+QLabel#pill { padding: 4px 10px; border-radius: 11px; background: $INPUT; color: $DIM;
               border: 1px solid $BORDER; font-weight: 600; }
 QLabel#pill[state="on"]   { color: $ACCENT2; border: 1px solid $ACCENT2; }
 QLabel#pill[state="busy"] { color: $YELLOW; border: 1px solid $YELLOW; }
@@ -182,7 +182,7 @@ QWidget#videoWin { background: $BG; }
 QFrame#videoSurface { background: #000000; border: 1px solid $BORDER; border-radius: 8px; }
 
 QPushButton { background: $INPUT; color: $TEXT; border: 1px solid $BORDER; border-radius: 7px;
-              padding: 6px 14px; font-weight: 600; min-height: 20px; }
+              padding: 4px 12px; font-weight: 600; min-height: 18px; }
 QPushButton:hover { background: $HOVER; }
 QPushButton:pressed { background: $PANEL; }
 QPushButton:disabled { color: $DIM; background: $PANEL; border: 1px solid $BORDER; }
@@ -195,23 +195,23 @@ QPushButton#success:disabled { background: $PANEL; color: $DIM; border: 1px soli
 QPushButton#danger { background: $INPUT; color: $WARN; border: 1px solid $WARN; }
 QPushButton#danger:hover { background: $WARN_SOFT; }
 QPushButton#danger:disabled { background: $PANEL; color: $DIM; border: 1px solid $BORDER; }
-QPushButton#quick { background: $INPUT; color: $TEXT; padding: 5px 12px; min-height: 22px; }
+QPushButton#quick { background: $INPUT; color: $TEXT; padding: 3px 10px; min-height: 18px; }
 QPushButton#quick:hover { color: $ACCENT; border: 1px solid $ACCENT; }
 QPushButton#quick[offline="true"] { color: $DIM; }
-QPushButton#icon { padding: 0; min-height: 30px; }
+QPushButton#icon { padding: 0; min-height: 26px; }
 QPushButton#tool[hasMenu="true"] { padding-right: 28px; }
 QPushButton#tool::menu-indicator { image: url($ARROW_URL); subcontrol-origin: padding;
                                    subcontrol-position: center right; right: 9px; width: 10px; height: 10px; }
 
 QFrame#segbar { background: $BG; border-radius: 8px; border: 1px solid $BORDER; }
-QPushButton[seg="true"] { background: transparent; color: $DIM; border: none; border-radius: 6px; padding: 5px 16px; }
+QPushButton[seg="true"] { background: transparent; color: $DIM; border: none; border-radius: 6px; padding: 4px 14px; }
 QPushButton[seg="true"]:hover { color: $TEXT; background: $INPUT; }
 QPushButton[seg="true"]:checked { background: $ACCENT; color: $ON_ACCENT; }
 QPushButton[seg="true"]:disabled { background: transparent; color: $BORDER; }
 QPushButton[seg="true"]:checked:disabled { background: $ACCENT; color: $ON_ACCENT; }
 
 QTabBar { background: transparent; }
-QTabBar::tab { background: transparent; color: $DIM; padding: 4px 12px; margin-right: 2px;
+QTabBar::tab { background: transparent; color: $DIM; padding: 3px 10px; margin-right: 2px;
                border: 1px solid transparent; border-radius: 6px; font-weight: 600; }
 QTabBar::tab:hover { color: $TEXT; background: $INPUT; }
 QTabBar::tab:selected { color: $ACCENT; background: $ACCENT_SOFT; border: 1px solid $ACCENT; }
@@ -219,12 +219,12 @@ QTabBar QToolButton { background: $INPUT; border: 1px solid $BORDER; border-radi
 
 QDialog, QMessageBox, QInputDialog { background: $PANEL; }
 QMenu { background: $PANEL; border: 1px solid $BORDER; border-radius: 8px; padding: 5px; }
-QMenu::item { padding: 7px 20px; border-radius: 5px; }
+QMenu::item { padding: 6px 18px; border-radius: 5px; }
 QMenu::item:selected { background: $ACCENT; color: $ON_ACCENT; }
 QMenu::separator { height: 1px; background: $BORDER; margin: 5px 8px; }
 
 QLineEdit, QComboBox { background: $INPUT; border: 1px solid $BORDER; border-radius: 7px;
-                       padding: 5px 9px; min-height: 20px; selection-background-color: $ACCENT; selection-color: $ON_ACCENT; }
+                       padding: 3px 8px; min-height: 18px; selection-background-color: $ACCENT; selection-color: $ON_ACCENT; }
 QLineEdit:focus, QComboBox:focus { border: 1px solid $ACCENT; }
 QComboBox::drop-down { border: none; width: 22px; }
 QComboBox::down-arrow { image: url($ARROW_URL); width: 11px; height: 11px; margin-right: 7px; }
@@ -232,7 +232,7 @@ QComboBox QAbstractItemView { background: $INPUT; border: 1px solid $BORDER; bor
                               selection-background-color: $ACCENT; selection-color: $ON_ACCENT; outline: 0; padding: 3px; }
 
 QFrame#termframe { background: $BG; border: 1px solid $BORDER; border-radius: 8px; }
-QPlainTextEdit#log { background: $BG; border: 1px solid $BORDER; border-radius: 8px; padding: 8px;
+QPlainTextEdit#log { background: $BG; border: 1px solid $BORDER; border-radius: 8px; padding: 6px;
                      selection-background-color: $ACCENT; selection-color: $ON_ACCENT; }
 
 QCheckBox, QRadioButton { spacing: 8px; color: $DIM; padding: 3px 0; }
@@ -355,7 +355,7 @@ class CmdDialog(QDialog):
         f.setVerticalSpacing(14)
         self.label = QLineEdit(label)
         self.cmd = QLineEdit(cmd)
-        self.cmd.setFont(MainWindow._mono(11))
+        self.cmd.setFont(MainWindow._mono(10))
         f.addRow("Button label", self.label)
         f.addRow("Command", self.cmd)
         v.addLayout(f)
@@ -851,7 +851,7 @@ class MainWindow(QMainWindow):
         lay.addWidget(self.pill)
         return h
 
-    SECTION_W = 140      # left label column, keeps the three bars aligned
+    SECTION_W = 120      # left label column, keeps the three bars aligned
 
     def _build_connection(self):
         card = self._card()
@@ -1087,7 +1087,7 @@ class MainWindow(QMainWindow):
         h.addWidget(self._section("SEND", self.SECTION_W))
         self.send_edit = QLineEdit()
         self.send_edit.setPlaceholderText("Type a command and press Enter  (↑ / ↓ = history)")
-        self.send_edit.setFont(self._mono(10))
+        self.send_edit.setFont(self._mono(9))
         self.send_edit.returnPressed.connect(self.send_custom)
         self.send_edit.installEventFilter(self)
         self.ending_cb = QComboBox(); self.ending_cb.addItems(["CR+LF", "CR", "LF", "None"])
@@ -1194,7 +1194,7 @@ class MainWindow(QMainWindow):
         self.log.setReadOnly(True)            # selecting + Ctrl+C work natively
         self.log.setMaximumBlockCount(MAX_LOG_LINES)
         self.log.setLineWrapMode(QPlainTextEdit.WidgetWidth)
-        self.log.setFont(self._mono(10))
+        self.log.setFont(self._mono(9))
         self.view_stack.addWidget(frame)
         self.view_stack.addWidget(self.log)
         v.addWidget(self.view_stack, 1)
@@ -1207,7 +1207,7 @@ class MainWindow(QMainWindow):
         self.chk_echo.setChecked(on("term_echo", "false"))
         self.chk_lf.setChecked(on("term_lf", "true"))
         try:
-            self.term.set_font_size(int(st.value("term_font", 10)))
+            self.term.set_font_size(int(st.value("term_font_pt", 9)))
         except (TypeError, ValueError):
             pass
         for w_ in (self.enter_cb, self.bs_cb):
@@ -1901,7 +1901,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, ev):
         self.settings.setValue("geometry", self.saveGeometry())
-        self.settings.setValue("term_font", self.term.font_pt)
+        self.settings.setValue("term_font_pt", self.term.font_pt)
         if self.session is not None:
             self.disconnect_session()
         if self.video_win is not None:

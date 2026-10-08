@@ -154,7 +154,7 @@ class TerminalWidget(QWidget):
 
         self.bar = QScrollBar(Qt.Vertical, self)
         self.bar.valueChanged.connect(self._bar_moved)
-        self.set_font_size(10)
+        self.set_font_size(9)
         self.set_colors("#0d1117", "#e6edf3", "#58a6ff", dark=True)
 
     # ── appearance ───────────────────────────────────────────────────────────
