@@ -24,7 +24,7 @@ import time
 import urllib.error
 import urllib.request
 
-GITHUB_REPO = ""                       # "owner/repo" — empty = update check disabled
+GITHUB_REPO = "KNOT-ARIGATO/SuperTerm"     # "owner/repo" — empty = update check disabled
 ASSET_NAME = "SuperTerm.exe"
 API_BASE = os.environ.get("SUPERTERM_UPDATE_API", "https://api.github.com")   # override for tests
 
