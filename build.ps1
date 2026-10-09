@@ -21,6 +21,7 @@ Run "PyInstaller" {
         --add-data "$root\assets;assets" `
         --hidden-import serial.tools.list_ports_windows `
         --exclude-module tkinter `
+        --exclude-module pytest `
         --distpath "$root\dist" --workpath "$root\build_tmp" --specpath "$root\build_tmp" `
         "$root\app.py"
 }

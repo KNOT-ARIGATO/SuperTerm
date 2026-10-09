@@ -126,6 +126,7 @@ class Session:
         self.on_line, self.on_info = on_line, on_info
         self.on_opened, self.on_closed = on_opened, on_closed
         self.on_data = on_data
+        self.rx_hook = None         # when set (file transfer), received bytes go only here
         self.stop_evt = threading.Event()
         self._thread = None
         self._opened = False
@@ -170,6 +171,10 @@ class Session:
 
     def _received(self, data, buf):
         """Fan raw bytes out to the terminal and complete lines to the log."""
+        hook = self.rx_hook
+        if hook is not None:
+            hook(data)
+            return
         if self.on_data:
             self.on_data(data)
         for line in buf.feed(data):
@@ -189,26 +194,58 @@ class Session:
         pass
 
 
+def list_ports():
+    """[(device, description)] e.g. ("COM7", "USB-SERIAL CH340"), sorted by number."""
+    import serial.tools.list_ports as lp
+    out = []
+    for p in lp.comports():
+        desc = (p.description or "").strip()
+        if desc.endswith(f"({p.device})"):
+            desc = desc[: -len(p.device) - 2].strip()
+        out.append((p.device, desc if desc and desc != "n/a" else ""))
+    key = lambda d: (int(re.sub(r"\D", "", d[0]) or 0), d[0])
+    return sorted(out, key=key)
+
+
 # ══════════════════════════════════════════════════════════════
 class SerialSession(Session):
     kind = "Serial"
 
-    def __init__(self, port, baud, bytesize, parity, stopbits, **cb):
+    def __init__(self, port, baud, bytesize, parity, stopbits, auto_reconnect=False, **cb):
         super().__init__(**cb)
         self.port, self.baud = port, baud
         self.bytesize, self.parity, self.stopbits = bytesize, parity, stopbits
+        self.auto_reconnect = auto_reconnect
         self.ser = None
         self.label = f"Serial  {port} @ {baud}"
 
+    def _open(self):
+        return serial.Serial(port=self.port, baudrate=self.baud, bytesize=self.bytesize,
+                             parity=self.parity, stopbits=self.stopbits, timeout=0)
+
+    def _wait_for_port(self):
+        """USB-UART unplugged / board rebooting: retry until the port is back."""
+        self.on_info(f"{self.port} lost — waiting for it to come back…", "warn")
+        while not self.stop_evt.is_set():
+            if any(d == self.port for d, _ in list_ports()):
+                try:
+                    self.ser = self._open()
+                    self.on_info(f"Reconnected → {self.port} @ {self.baud}", "success")
+                    return True
+                except (serial.SerialException, OSError):
+                    pass                       # driver not ready yet
+            self.stop_evt.wait(1.0)
+        return False
+
     def _run(self):
         try:
-            self.ser = serial.Serial(port=self.port, baudrate=self.baud, bytesize=self.bytesize,
-                                     parity=self.parity, stopbits=self.stopbits, timeout=0)
+            self.ser = self._open()
         except (serial.SerialException, ValueError, OSError) as e:
             return str(e), True
         self._mark_open()
-        ser, buf, last = self.ser, LineBuffer(), time.monotonic()
+        buf, last = LineBuffer(), time.monotonic()
         while not self.stop_evt.is_set():
+            ser = self.ser
             try:
                 n = ser.in_waiting
                 if n:
@@ -224,7 +261,12 @@ class SerialSession(Session):
                         if pending:
                             self.on_line(pending)
                     time.sleep(0.004)        # idle: don't spin the CPU
-            except (serial.SerialException, OSError) as e:
+            except (serial.SerialException, OSError, AttributeError) as e:
+                if self.stop_evt.is_set():
+                    break
+                self._close_io()
+                if self.auto_reconnect and self._wait_for_port():
+                    continue
                 return f"Serial error — port disconnected ({e})", True
         return "", False
 

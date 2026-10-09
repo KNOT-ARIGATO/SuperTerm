@@ -39,12 +39,24 @@ def configured():
 
 
 def parse_version(text):
-    nums = [int(n) for n in re.findall(r"\d+", text or "")[:3]]
-    return tuple(nums + [0] * (3 - len(nums)))
+    """'v1.2.0' -> (1, 2, 0, 1, 0);  'v1.2.0-beta.3' -> (1, 2, 0, 0, 3).
+    A final release sorts after all its betas."""
+    text = (text or "").strip().lstrip("vV")
+    core, _, pre = text.partition("-")
+    nums = [int(n) for n in re.findall(r"\d+", core)[:3]]
+    nums += [0] * (3 - len(nums))
+    if not pre:
+        return tuple(nums) + (1, 0)
+    pre_num = re.findall(r"\d+", pre)
+    return tuple(nums) + (0, int(pre_num[-1]) if pre_num else 0)
 
 
 def is_newer(latest, current):
     return parse_version(latest) > parse_version(current)
+
+
+def is_prerelease(tag):
+    return "-" in (tag or "")
 
 
 _SSL_CTX = None
@@ -76,14 +88,27 @@ def _open(url, timeout):
     return urllib.request.urlopen(req, timeout=timeout, context=_ssl_context())
 
 
-def check_latest(repo=None, timeout=8):
-    """Latest release info: dict(version, name, notes, exe_url, sha_url, page)."""
+def _pick_beta(releases):
+    """Newest non-draft release, betas included."""
+    cands = [r for r in releases if isinstance(r, dict) and not r.get("draft")]
+    if not cands:
+        raise UpdateError("No release found — or the repository is private.")
+    return max(cands, key=lambda r: parse_version(r.get("tag_name", "")))
+
+
+def check_latest(repo=None, timeout=8, channel="stable"):
+    """Latest release info: dict(version, name, notes, exe_url, sha_url, page).
+    channel "stable" = newest normal release; "beta" also offers pre-releases."""
     repo = (repo or GITHUB_REPO).strip()
     if not repo:
         raise UpdateError("The update source (GitHub repository) is not configured yet.")
     try:
-        with _open(f"{API_BASE}/repos/{repo}/releases/latest", timeout) as r:
-            rel = json.load(r)
+        if channel == "beta":
+            with _open(f"{API_BASE}/repos/{repo}/releases?per_page=20", timeout) as r:
+                rel = _pick_beta(json.load(r))
+        else:
+            with _open(f"{API_BASE}/repos/{repo}/releases/latest", timeout) as r:
+                rel = json.load(r)
     except urllib.error.HTTPError as e:
         if e.code == 404:
             raise UpdateError("No release found — or the repository is private.")

@@ -1,5 +1,6 @@
-# Push a tag like v1.1.0  →  GitHub builds SuperTerm.exe on Windows,
-# runs its self-test and publishes it (plus a SHA-256 file) as a Release.
+# Push a tag like v1.2.0 (or v1.2.0-beta.1 for the Beta channel)  →  GitHub runs
+# the tests, builds SuperTerm.exe on Windows, self-tests it, optionally signs it,
+# and publishes it (plus a SHA-256 file) as a Release.
 # The built-in updater of SuperTerm downloads exactly these two files.
 name: Build & release SuperTerm
 
@@ -14,10 +15,15 @@ permissions:
 jobs:
   build:
     runs-on: windows-latest
+    env:
+      # Optional code signing: add these two repository secrets to sign the exe
+      #   SIGN_PFX_BASE64   = base64 of your .pfx code-signing certificate
+      #   SIGN_PFX_PASSWORD = its password
+      SIGN_PFX: ${{ secrets.SIGN_PFX_BASE64 }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -31,9 +37,28 @@ jobs:
       - name: Install
         run: python -m pip install -r requirements-build.txt
 
+      - name: Tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m pytest -q tests
+
       - name: Build SuperTerm.exe
         shell: pwsh
         run: ./build.ps1
+
+      - name: Sign the exe (only when a certificate is configured)
+        if: env.SIGN_PFX != ''
+        shell: pwsh
+        env:
+          SIGN_PFX_PASSWORD: ${{ secrets.SIGN_PFX_PASSWORD }}
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP "sign.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX))
+          $st = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe |
+                Where-Object FullName -match '\\x64\\' | Sort-Object FullName -Descending | Select-Object -First 1
+          & $st.FullName sign /f $pfx /p $env:SIGN_PFX_PASSWORD /fd sha256 /tr http://timestamp.digicert.com /td sha256 dist/SuperTerm.exe
+          if ($LASTEXITCODE -ne 0) { throw "signing failed" }
+          Remove-Item $pfx
 
       - name: Self-test the exe
         shell: pwsh
@@ -48,7 +73,7 @@ jobs:
           $h = (Get-FileHash dist/SuperTerm.exe -Algorithm SHA256).Hash.ToLower()
           "$h  SuperTerm.exe" | Out-File -Encoding ascii dist/SuperTerm.exe.sha256
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: SuperTerm
           path: |
@@ -57,9 +82,10 @@ jobs:
 
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/SuperTerm.exe
             dist/SuperTerm.exe.sha256
+          prerelease: ${{ contains(github.ref_name, '-') }}
           generate_release_notes: true

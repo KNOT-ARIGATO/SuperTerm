@@ -5,6 +5,7 @@ One connection at a time (see sessions.py). Settings live in
 ssh_passwords.json is only READ (saved-password picker).
 """
 import sys
+import subprocess
 import threading
 import traceback
 import os
@@ -12,16 +13,23 @@ import re
 import json
 import time
 from collections import deque
+from datetime import datetime
 from string import Template
 
 import serial
 import serial.tools.list_ports
-from sessions import SerialSession, TelnetSession, SshSession
+from sessions import SerialSession, TelnetSession, SshSession, list_ports
 from quickstore import QuickStore, PROTOCOLS, detect_import
 from nature import NATURE
 from terminal import TerminalWidget, ENTER_CODES, BS_CODES
 import updater
-from PySide6.QtCore import Qt, Signal, QTimer, QSettings, QUrl, QRect, QSize, QPoint, QObject
+import i18n
+from i18n import T
+from logwriter import LogWriter, default_log_dir
+from profiles import ProfileStore
+from testrunner import SequenceStore
+from panels import SettingsDialog, TestRunnerWindow, TransferDialog
+from PySide6.QtCore import Qt, Signal, QTimer, QSettings, QUrl, QRect, QSize, QPoint, QObject, QEvent
 from PySide6.QtGui import QFont, QTextCharFormat, QColor, QTextCursor, QIcon, QDesktopServices
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFrame, QLabel, QPushButton, QComboBox,
@@ -34,7 +42,7 @@ MAX_LOG_LINES = 50000
 FLUSH_MS = 40            # log output is batched: one UI update per 40 ms ...
 FLUSH_MAX = 1500         # ... of at most this many lines
 APP_NAME = "SuperTerm"
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.1.0"
 OLD_NAMES = ("SuperTeam", "UartLogViewer")   # earlier names of this app (settings migration)
 
 
@@ -100,12 +108,12 @@ def install_crash_handler():
 THEMES = {
     # same colours as the original SuperSerial program — the calm default
     "Classic Dark": dict(
-        BG="#0d1117", PANEL="#161b22", INPUT="#21262d", BORDER="#30363d",
+        BG="#0d1117", PANEL="#161b22", INPUT="#232a33", BORDER="#363e48",
         ACCENT="#58a6ff", ACCENT2="#3fb950", WARN="#f85149", TEXT="#e6edf3",
         DIM="#8b949e", MAUVE="#bc8cff", SKY="#79c0ff", PEACH="#ffa657",
         YELLOW="#e3b341", ON_ACCENT="#0d1117"),
     "Classic Light": dict(
-        BG="#f6f8fa", PANEL="#ffffff", INPUT="#f6f8fa", BORDER="#d0d7de",
+        BG="#eef1f5", PANEL="#ffffff", INPUT="#f3f5f8", BORDER="#cfd6de",
         ACCENT="#0969da", ACCENT2="#1a7f37", WARN="#cf222e", TEXT="#1f2328",
         DIM="#656d76", MAUVE="#8250df", SKY="#218bff", PEACH="#bc4c00",
         YELLOW="#9a6700", ON_ACCENT="#ffffff"),
@@ -149,6 +157,9 @@ def _mix(a, b, t):
 def derive(p):
     """Extra shades used by the stylesheet (soft tints, hover stops)."""
     return dict(
+        SEC_CONN=p["SKY"], SEC_QUICK=p["MAUVE"], SEC_OUT=p["ACCENT2"],
+        QUICK_SOFT=_mix(p["MAUVE"], p["PANEL"], .86),
+        QUICK_LINE=_mix(p["MAUVE"], p["PANEL"], .55),
         HOVER=_mix(p["INPUT"], p["TEXT"], .08),
         ACCENT_SOFT=_mix(p["ACCENT"], p["PANEL"], .86),
         ACCENT_H=_mix(p["ACCENT"], "#ffffff", .15),
@@ -171,6 +182,14 @@ QLabel#badge { background: $INPUT; color: $DIM; border: 1px solid $BORDER; borde
                padding: 1px 7px; font-size: 9px; font-weight: 700; }
 
 QFrame#card { background: $PANEL; border: 1px solid $BORDER; border-radius: 10px; }
+QFrame#card[sec="conn"]  { border-top: 3px solid $SEC_CONN; }
+QFrame#card[sec="quick"] { border-top: 3px solid $SEC_QUICK; }
+QFrame#card[sec="out"]   { border-top: 3px solid $SEC_OUT; }
+QLabel#section[sec="conn"]  { color: $SEC_CONN; }
+QLabel#section[sec="quick"] { color: $SEC_QUICK; }
+QLabel#section[sec="out"]   { color: $SEC_OUT; }
+QLabel#edithint { color: $YELLOW; font-weight: 600; }
+QPushButton#lang { padding: 4px 10px; font-weight: 700; }
 QFrame#header { background: $PANEL; border-bottom: 1px solid $BORDER; }
 
 QLabel#pill { padding: 4px 10px; border-radius: 11px; background: $INPUT; color: $DIM;
@@ -195,26 +214,36 @@ QPushButton#success:disabled { background: $PANEL; color: $DIM; border: 1px soli
 QPushButton#danger { background: $INPUT; color: $WARN; border: 1px solid $WARN; }
 QPushButton#danger:hover { background: $WARN_SOFT; }
 QPushButton#danger:disabled { background: $PANEL; color: $DIM; border: 1px solid $BORDER; }
-QPushButton#quick { background: $INPUT; color: $TEXT; padding: 3px 10px; min-height: 18px; }
-QPushButton#quick:hover { color: $ACCENT; border: 1px solid $ACCENT; }
+QPushButton#quick { background: $QUICK_SOFT; color: $TEXT; border: 1px solid $QUICK_LINE;
+                    padding: 4px 12px; min-height: 18px; font-weight: 600; }
+QPushButton#quick:hover { border: 1px solid $SEC_QUICK; color: $SEC_QUICK; }
 QPushButton#quick[offline="true"] { color: $DIM; }
+QPushButton#quick[editing="true"] { border: 1px dashed $YELLOW; color: $YELLOW; }
+QPushButton#addchip { background: transparent; color: $SEC_QUICK; border: 1px dashed $QUICK_LINE;
+                      padding: 4px 12px; min-height: 18px; }
+QPushButton#addchip:hover { border: 1px dashed $SEC_QUICK; background: $QUICK_SOFT; }
+QPushButton#group { background: $INPUT; color: $TEXT; border: 1px solid $BORDER; border-radius: 13px;
+                    padding: 4px 16px; font-weight: 700; }
+QPushButton#group:hover { border: 1px solid $SEC_QUICK; }
+QPushButton#group:checked { background: $SEC_QUICK; color: $ON_ACCENT; border: 1px solid $SEC_QUICK; }
 QPushButton#icon { padding: 0; min-height: 26px; }
 QPushButton#tool[hasMenu="true"] { padding-right: 28px; }
 QPushButton#tool::menu-indicator { image: url($ARROW_URL); subcontrol-origin: padding;
                                    subcontrol-position: center right; right: 9px; width: 10px; height: 10px; }
 
 QFrame#segbar { background: $BG; border-radius: 8px; border: 1px solid $BORDER; }
-QPushButton[seg="true"] { background: transparent; color: $DIM; border: none; border-radius: 6px; padding: 4px 14px; }
-QPushButton[seg="true"]:hover { color: $TEXT; background: $INPUT; }
-QPushButton[seg="true"]:checked { background: $ACCENT; color: $ON_ACCENT; }
-QPushButton[seg="true"]:disabled { background: transparent; color: $BORDER; }
-QPushButton[seg="true"]:checked:disabled { background: $ACCENT; color: $ON_ACCENT; }
+QFrame#segbar QPushButton { background: transparent; color: $DIM; border: none; border-radius: 6px; padding: 4px 14px; }
+QFrame#segbar QPushButton:hover { color: $TEXT; background: $INPUT; }
+QFrame#segbar QPushButton:disabled { background: transparent; color: $BORDER; }
+QFrame#segbar QPushButton[seg="conn"]:checked,
+QFrame#segbar QPushButton[seg="conn"]:checked:disabled { background: $SEC_CONN; color: $ON_ACCENT; font-weight: 700; }
+QFrame#segbar QPushButton[seg="out"]:checked { background: $SEC_OUT; color: $ON_ACCENT; font-weight: 700; }
 
 QTabBar { background: transparent; }
 QTabBar::tab { background: transparent; color: $DIM; padding: 3px 10px; margin-right: 2px;
                border: 1px solid transparent; border-radius: 6px; font-weight: 600; }
 QTabBar::tab:hover { color: $TEXT; background: $INPUT; }
-QTabBar::tab:selected { color: $ACCENT; background: $ACCENT_SOFT; border: 1px solid $ACCENT; }
+QTabBar::tab:selected { color: $SEC_QUICK; background: $QUICK_SOFT; border: 1px solid $SEC_QUICK; }
 QTabBar QToolButton { background: $INPUT; border: 1px solid $BORDER; border-radius: 6px; }
 
 QDialog, QMessageBox, QInputDialog { background: $PANEL; }
@@ -254,6 +283,12 @@ QScrollBar:horizontal { background: transparent; height: 10px; margin: 2px; }
 QScrollBar::handle:horizontal { background: $BORDER; border-radius: 4px; min-width: 30px; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 QToolTip { background: $INPUT; color: $TEXT; border: 1px solid $BORDER; }
+QTableWidget { background: $BG; color: $TEXT; gridline-color: $BORDER; border: 1px solid $BORDER;
+               border-radius: 6px; selection-background-color: $ACCENT; selection-color: $ON_ACCENT; }
+QHeaderView::section { background: $PANEL; color: $DIM; border: none; border-bottom: 1px solid $BORDER;
+                       border-right: 1px solid $BORDER; padding: 4px 6px; font-weight: 600; }
+QTableCornerButton::section { background: $PANEL; border: none; }
+QDoubleSpinBox { background: $INPUT; border: 1px solid $BORDER; border-radius: 5px; padding: 1px 4px; }
 QProgressBar { background: $INPUT; border: 1px solid $BORDER; border-radius: 6px; text-align: center;
                color: $TEXT; min-height: 18px; }
 QProgressBar::chunk { background: $ACCENT; border-radius: 5px; }
@@ -343,46 +378,100 @@ class FlowLayout(QLayout):
 
 
 class CmdDialog(QDialog):
-    def __init__(self, parent, title, label="", cmd=""):
+    """Add / edit one quick command. In edit mode it can also delete / move it."""
+
+    def __init__(self, parent, title, label="", cmd="", editing=False):
         super().__init__(parent)
+        self.action = "save"
         self.setWindowTitle(title)
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(480)
         v = QVBoxLayout(self)
-        v.setContentsMargins(24, 22, 24, 22)
-        v.setSpacing(14)
+        v.setContentsMargins(22, 20, 22, 20)
+        v.setSpacing(12)
         f = QFormLayout()
-        f.setHorizontalSpacing(16)
-        f.setVerticalSpacing(14)
+        f.setHorizontalSpacing(14)
+        f.setVerticalSpacing(12)
         self.label = QLineEdit(label)
         self.cmd = QLineEdit(cmd)
         self.cmd.setFont(MainWindow._mono(10))
-        f.addRow("Button label", self.label)
-        f.addRow("Command", self.cmd)
+        f.addRow(T("Button label"), self.label)
+        f.addRow(T("Command"), self.cmd)
         v.addLayout(f)
-        hint = QLabel("Use  |  to send several commands in sequence.")
+        hint = QLabel(T("Use  |  to send several commands in sequence."))
         hint.setObjectName("hint")
         v.addWidget(hint)
         row = QHBoxLayout()
-        row.setSpacing(10)
+        row.setSpacing(8)
+        if editing:
+            for text, act, obj in (("🗑  " + T("Delete"), "delete", "danger"),
+                                   ("◀", "left", None), ("▶", "right", None)):
+                b = QPushButton(text)
+                if obj:
+                    b.setObjectName(obj)
+                b.clicked.connect(lambda _=False, a=act: self._finish(a))
+                row.addWidget(b)
         row.addStretch(1)
-        cancel = QPushButton("Cancel")
+        cancel = QPushButton(T("Cancel"))
         cancel.clicked.connect(self.reject)
-        save = QPushButton("Save")
+        save = QPushButton(T("Save"))
         save.setObjectName("primary")
         save.setDefault(True)
-        save.clicked.connect(self._accept)
+        save.clicked.connect(lambda: self._finish("save"))
         row.addWidget(cancel)
         row.addWidget(save)
         v.addLayout(row)
 
-    def _accept(self):
-        if self.label.text().strip() and self.cmd.text().strip():
-            self.accept()
-        else:
-            QMessageBox.warning(self, "Missing", "Both label and command are required.")
+    def _finish(self, action):
+        if action == "save" and not (self.label.text().strip() and self.cmd.text().strip()):
+            QMessageBox.warning(self, "Missing", T("Both label and command are required."))
+            return
+        self.action = action
+        self.accept()
 
     def values(self):
         return self.label.text().strip(), self.cmd.text().strip()
+
+
+class NameEditDialog(QDialog):
+    """Edit mode for a group or tab: rename / move left-right / delete."""
+
+    def __init__(self, parent, what, name):
+        super().__init__(parent)
+        self.action = "save"
+        self.setWindowTitle(f"{T('Edit')} — {what}")
+        self.setMinimumWidth(420)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(22, 20, 22, 20)
+        v.setSpacing(12)
+        self.name = QLineEdit(name)
+        f = QFormLayout()
+        f.addRow(what, self.name)
+        v.addLayout(f)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        for text, act, obj in (("🗑  " + T("Delete"), "delete", "danger"), ("◀", "left", None), ("▶", "right", None)):
+            b = QPushButton(text)
+            if obj:
+                b.setObjectName(obj)
+            b.clicked.connect(lambda _=False, a=act: self._finish(a))
+            row.addWidget(b)
+        row.addStretch(1)
+        cancel = QPushButton(T("Cancel"))
+        cancel.clicked.connect(self.reject)
+        ok = QPushButton(T("Save"))
+        ok.setObjectName("primary")
+        ok.setDefault(True)
+        ok.clicked.connect(lambda: self._finish("save"))
+        row.addWidget(cancel)
+        row.addWidget(ok)
+        v.addLayout(row)
+
+    def _finish(self, action):
+        self.action = action
+        self.accept()
+
+    def value(self):
+        return self.name.text().strip()
 
 
 class ImportDialog(QDialog):
@@ -412,8 +501,13 @@ class ImportDialog(QDialog):
         v.addWidget(src)
 
         if kind == "legacy":
-            fmt = "Old program — SuperSerial (quick_commands.json)"
+            fmt = "Old program — SuperSerial (quick_commands.json) → group “SuperSerial”"
             lines = [f"• {p['name']}  —  {len(p['cmds'])} command(s)" for p in payload]
+        elif kind == "v3":
+            fmt = "SuperTerm export"
+            lines = [f"• {self.LABELS[k]}:  {len(g_)} group(s), {sum(len(t_['tabs']) for t_ in g_)} tab(s), "
+                     f"{sum(len(x['cmds']) for t_ in g_ for x in t_['tabs'])} command(s)"
+                     for k, g_ in payload.items() if g_]
         else:
             fmt = "SuperTerm export"
             lines = [f"• {self.LABELS[k]}:  {len(v_)} tab(s), {sum(len(x['cmds']) for x in v_)} command(s)"
@@ -738,10 +832,18 @@ class MainWindow(QMainWindow):
         self._update_info = None
         self.t0 = time.monotonic()
         self.log_lines = deque(maxlen=MAX_LOG_LINES)   # (text, tag, is_sys)
-        self.history = []
-        self.hist_idx = -1
         self.store = QuickStore(os.path.join(user_data_dir(), "quick_commands_by_protocol.json"))
+        self.profiles = ProfileStore(os.path.join(user_data_dir(), "profiles.json"))
+        self.sequences = SequenceStore(os.path.join(user_data_dir(), "sequences.json"))
         self.quick_buttons = []
+        self._i18n = []                # (widget, kind, english text) for live TH / EN switching
+        self.test_win = None
+        self.logfile = None
+        self._hex_pending = []
+        self._last_beep = 0.0
+        self._compiled_rules = []
+        self._known_ports = None
+        self._compile_rules()
 
         root = QWidget()
         root.setObjectName("root")
@@ -756,7 +858,6 @@ class MainWindow(QMainWindow):
         body.setSpacing(10)
         body.addWidget(self._build_connection())
         body.addWidget(self._build_quick())
-        body.addWidget(self._build_send())
         body.addWidget(self._build_log_area(), 1)
         outer.addLayout(body, 1)
 
@@ -764,6 +865,8 @@ class MainWindow(QMainWindow):
         self.status_lines.setObjectName("hint")
         self.status_port = QLabel("")
         self.status_port.setObjectName("hint")
+        self.rec_lbl = QLabel("")
+        self.rec_lbl.setObjectName("hint")
         bar = QHBoxLayout()
         bar.setContentsMargins(18, 0, 18, 8)
         bar.addWidget(self.status_lines)
@@ -772,37 +875,94 @@ class MainWindow(QMainWindow):
         self.status_msg.setObjectName("hint")
         bar.addWidget(self.status_msg)
         bar.addStretch(1)
+        bar.addWidget(self.rec_lbl)
+        bar.addSpacing(16)
         bar.addWidget(self.status_port)
         outer.addLayout(bar)
 
         geo = self.settings.value("geometry")
         if geo:
             self.restoreGeometry(geo)
+        self._build_menus()
         self.apply_theme(self.theme_name)
-        self.refresh_ports()
+        self.refresh_ports(announce=True)
+        self._fill_conn_profiles()
         self.refresh_quick()
+        self._port_timer = QTimer(self)            # notice USB-UART plug / unplug
+        self._port_timer.setInterval(2000)
+        self._port_timer.timeout.connect(self._poll_ports)
+        self._port_timer.start()
         self._set_ui_state("idle")
         self.log_sys("Ready — pick ONE protocol (Serial / Telnet / SSH) and press Connect.", "info")
         updater.cleanup_old()                       # leftovers of the previous update
         QTimer.singleShot(4000, self._auto_check_update)
 
-    # ── building blocks ──────────────────────────────────────────────────────
-    def _card(self):
+    # ── building blocks (every visible text goes through _tr → live TH / EN) ──
+    def _tr(self, w, text, kind="text"):
+        self._i18n.append((w, kind, text))
+        self._apply_tr(w, kind, text)
+        return w
+
+    @staticmethod
+    def _apply_tr(w, kind, text):
+        val = T(text)
+        if kind == "text":
+            w.setText(val)
+        elif kind == "tip":
+            w.setToolTip(val)
+        elif kind == "placeholder":
+            w.setPlaceholderText(val)
+
+    def retranslate(self):
+        alive = []
+        for w, kind, text in self._i18n:
+            try:
+                self._apply_tr(w, kind, text)
+                alive.append((w, kind, text))
+            except RuntimeError:                  # widget already deleted
+                pass
+        self._i18n = alive
+        self._build_menus()
+        self._fill_conn_profiles()
+        self.lang_btn.setText("🌐 " + i18n.LANG.upper())
+        self.refresh_quick()
+        if self.session is None:
+            self._set_pill(T("●  Disconnected"), "off")
+
+    def toggle_language(self):
+        i18n.set_lang("en" if i18n.LANG == "th" else "th")
+        self.settings.setValue("language", i18n.LANG)
+        self.retranslate()
+
+    def _card(self, sec):
         f = QFrame()
         f.setObjectName("card")
+        f.setProperty("sec", sec)
         return f
 
-    def _section(self, text, width=None):
-        lab = QLabel(text)
+    def _section(self, text, sec, width=None):
+        lab = QLabel()
         lab.setObjectName("section")
+        lab.setProperty("sec", sec)
         if width:
             lab.setFixedWidth(width)
-        return lab
+        return self._tr(lab, text)
 
     def _field(self, text):
-        lab = QLabel(text)
+        lab = QLabel()
         lab.setObjectName("field")
-        return lab
+        return self._tr(lab, text)
+
+    def _btn(self, text, obj=None, tip=None, slot=None):
+        b = QPushButton()
+        if obj:
+            b.setObjectName(obj)
+        self._tr(b, text)
+        if tip:
+            self._tr(b, tip, "tip")
+        if slot:
+            b.clicked.connect(slot)
+        return b
 
     def _row(self):
         w = QWidget()
@@ -811,12 +971,33 @@ class MainWindow(QMainWindow):
         h.setSpacing(8)
         return w, h
 
+    def _seg(self, names, sec, slot):
+        frame = QFrame()
+        frame.setObjectName("segbar")
+        lay = QHBoxLayout(frame)
+        lay.setContentsMargins(3, 3, 3, 3)
+        lay.setSpacing(2)
+        group = QButtonGroup(self)
+        for i, (name, tip) in enumerate(names):
+            b = QPushButton()
+            b.setCheckable(True)
+            b.setProperty("seg", sec)
+            b.setCursor(Qt.PointingHandCursor)
+            self._tr(b, name)
+            if tip:
+                self._tr(b, tip, "tip")
+            group.addButton(b, i)
+            lay.addWidget(b)
+        group.idClicked.connect(slot)
+        return frame, group
+
+    # ── header ───────────────────────────────────────────────────────────────
     def _build_header(self):
         h = QFrame()
         h.setObjectName("header")
         lay = QHBoxLayout(h)
-        lay.setContentsMargins(18, 8, 18, 8)
-        lay.setSpacing(10)
+        lay.setContentsMargins(16, 7, 16, 7)
+        lay.setSpacing(8)
         title = QLabel(APP_NAME)
         title.setObjectName("title")
         self.title_lbl = title
@@ -826,80 +1007,94 @@ class MainWindow(QMainWindow):
         lay.addWidget(sub, 0, Qt.AlignVCenter)
         lay.addStretch(1)
 
-        self.btn_update = QPushButton("Check updates")
-        self.btn_update.setToolTip("Look for a newer SuperTerm on GitHub")
-        self.btn_update.clicked.connect(self.update_clicked)
+        self.btn_update = QPushButton()
+        self.btn_update.setObjectName("primary")
+        self.btn_update.setVisible(False)              # shown only when a newer version exists
+        self.btn_update.clicked.connect(self._show_update)
         lay.addWidget(self.btn_update)
-        video_btn = QPushButton("RTSP Video")
-        video_btn.setToolTip("Separate camera test window — independent of the log connection")
-        video_btn.clicked.connect(self.open_video)
-        lay.addWidget(video_btn)
-        lay.addSpacing(6)
-        lay.addWidget(self._field("Theme"))
+        lay.addWidget(self._btn("Tests", "tool", "Test sequences", self.open_tests))
+        self.tools_btn = self._btn("Tools", "tool")
+        self.tools_btn.setProperty("hasMenu", True)
+        lay.addWidget(self.tools_btn)
+        lay.addWidget(self._btn("Settings", "tool", None, self.open_settings))
+        self.help_btn = self._btn("Help", "tool")
+        self.help_btn.setProperty("hasMenu", True)
+        lay.addWidget(self.help_btn)
+        self.lang_btn = QPushButton("🌐 " + i18n.LANG.upper())
+        self.lang_btn.setObjectName("lang")
+        self.lang_btn.setToolTip("ภาษาไทย / English")
+        self.lang_btn.clicked.connect(self.toggle_language)
+        lay.addWidget(self.lang_btn)
         self.theme_cb = QComboBox()
         for n in THEMES:
             self.theme_cb.addItem(f"{NATURE[n]['logo']}  {n}", n)
         self.theme_cb.setCurrentIndex(max(0, self.theme_cb.findData(self.theme_name)))
         self.theme_cb.currentIndexChanged.connect(
             lambda i: self.apply_theme(self.theme_cb.itemData(i)))
-        self.theme_cb.setMinimumWidth(160)
+        self.theme_cb.setMinimumWidth(150)
+        self._tr(self.theme_cb, "Theme", "tip")
         lay.addWidget(self.theme_cb)
-        lay.addSpacing(6)
-        self.pill = QLabel("●  Disconnected")
+        self.pill = QLabel()
         self.pill.setObjectName("pill")
         self.pill.setProperty("state", "off")
+        self.pill.setText(T("●  Disconnected"))
         lay.addWidget(self.pill)
         return h
 
-    SECTION_W = 120      # left label column, keeps the three bars aligned
+    def _build_menus(self):
+        m = QMenu(self)
+        m.addAction(T("New window"), self.open_new_window)
+        m.addAction(T("RTSP Video"), self.open_video)
+        m.addAction(T("Send file (XMODEM / YMODEM)…"), self.open_transfer)
+        m.addAction(T("Test sequences"), self.open_tests)
+        self.tools_btn.setMenu(m)
+        hm = QMenu(self)
+        hm.addAction(T("Check for updates"), lambda: self._check_update(manual=True))
+        hm.addAction(T("Report a problem…"), self.report_problem)
+        hm.addSeparator()
+        hm.addAction(T("Open log folder"), lambda: self._open_folder(self._log_dir()))
+        hm.addAction(T("Open settings folder"), lambda: self._open_folder(user_data_dir()))
+        hm.addAction(T("Third-party licences"), lambda: QDesktopServices.openUrl(QUrl(
+            f"https://github.com/{updater.GITHUB_REPO}/blob/main/THIRD_PARTY_NOTICES.md")))
+        hm.addAction(T("About SuperTerm"), self.show_about)
+        self.help_btn.setMenu(hm)
 
+    SECTION_W = 120      # left label column, keeps the bars aligned
+
+    # ── connection ───────────────────────────────────────────────────────────
     def _build_connection(self):
-        card = self._card()
+        card = self._card("conn")
         v = QVBoxLayout(card)
         v.setContentsMargins(14, 10, 14, 10)
         v.setSpacing(8)
         top = QHBoxLayout()
-        top.setSpacing(10)
-        self.sec_conn = self._section("CONNECTION", self.SECTION_W)
+        top.setSpacing(8)
+        self.sec_conn = self._section("CONNECTION", "conn", self.SECTION_W)
         top.addWidget(self.sec_conn)
-        seg = QFrame()
-        seg.setObjectName("segbar")
-        sl = QHBoxLayout(seg)
-        sl.setContentsMargins(3, 3, 3, 3)
-        sl.setSpacing(2)
-        self.seg_group = QButtonGroup(self)
         self.stack = QStackedWidget()
-        for i, name in enumerate(("Serial", "Telnet", "SSH")):
-            b = QPushButton(name)
-            b.setCheckable(True)
-            b.setProperty("seg", True)
-            b.setCursor(Qt.PointingHandCursor)
-            self.seg_group.addButton(b, i)
-            sl.addWidget(b)
-            if i == 0:
-                b.setChecked(True)
-        self.seg_group.idClicked.connect(self.stack.setCurrentIndex)
-        self.seg_group.idClicked.connect(lambda _: self.refresh_quick())
+        seg, self.seg_group = self._seg((("Serial", None), ("Telnet", None), ("SSH", None)), "conn",
+                                        self._protocol_changed)
+        self.seg_group.button(0).setChecked(True)
         top.addWidget(seg)
-        hint = self._field("one connection at a time")
-        hint.setObjectName("hint")
-        top.addWidget(hint)
+        top.addSpacing(8)
+        self.prof_cb = QComboBox()
+        self.prof_cb.setMinimumWidth(170)
+        self.prof_cb.activated.connect(self._profile_selected)
+        top.addWidget(self.prof_cb)
+        top.addWidget(self._btn("💾", "icon", "Save these settings as a profile", self.profile_save))
+        top.addWidget(self._btn("🗑", "icon", "Delete the selected profile", self.profile_delete))
         top.addStretch(1)
-        self.btn_connect = QPushButton("▶  Connect")
-        self.btn_connect.setObjectName("success")
+        self.btn_connect = self._btn("▶  Connect", "success", None, self.connect_session)
         self.btn_connect.setMinimumWidth(120)
-        self.btn_connect.clicked.connect(self.connect_session)
-        self.btn_disconnect = QPushButton("■  Disconnect")
-        self.btn_disconnect.setObjectName("danger")
+        self.btn_disconnect = self._btn("■  Disconnect", "danger", None, self.disconnect_session)
         self.btn_disconnect.setMinimumWidth(120)
-        self.btn_disconnect.clicked.connect(self.disconnect_session)
         top.addWidget(self.btn_connect)
         top.addWidget(self.btn_disconnect)
         v.addLayout(top)
 
         fields = QHBoxLayout()
         fields.setSpacing(10)
-        fields.addSpacing(self.SECTION_W + 10)
+        fields.addSpacing(self.SECTION_W + 8)
         self.stack.addWidget(self._page_serial())
         self.stack.addWidget(self._page_telnet())
         self.stack.addWidget(self._page_ssh())
@@ -910,12 +1105,9 @@ class MainWindow(QMainWindow):
     def _page_serial(self):
         w, h = self._row()
         self.port_cb = QComboBox()
-        self.port_cb.setMinimumWidth(110)
-        refresh = QPushButton("⟳")
-        refresh.setObjectName("icon")
-        refresh.setFixedWidth(34)
-        refresh.setToolTip("Refresh ports")
-        refresh.clicked.connect(self.refresh_ports)
+        self.port_cb.setMinimumWidth(230)
+        refresh = self._btn("⟳", "icon", "Refresh ports", lambda: self.refresh_ports(announce=True))
+        refresh.setFixedWidth(30)
         self.baud_cb = QComboBox()
         self.baud_cb.addItems(["9600", "19200", "38400", "57600", "115200",
                                "230400", "460800", "921600"])
@@ -928,9 +1120,16 @@ class MainWindow(QMainWindow):
         h.addWidget(refresh)
         for lbl, cb in (("Baud", self.baud_cb), ("Data", self.data_cb),
                         ("Parity", self.parity_cb), ("Stop", self.stop_cb)):
-            h.addSpacing(8)
+            h.addSpacing(6)
             h.addWidget(self._field(lbl))
             h.addWidget(cb)
+        h.addSpacing(10)
+        self.chk_reconnect = QCheckBox()
+        self._tr(self.chk_reconnect, "Auto-reconnect")
+        self._tr(self.chk_reconnect, "Reconnect by itself when the USB-UART is unplugged / the board reboots", "tip")
+        self.chk_reconnect.setChecked(str(self.settings.value("serial_auto", "true")).lower() == "true")
+        self.chk_reconnect.toggled.connect(lambda on: self.settings.setValue("serial_auto", "true" if on else "false"))
+        h.addWidget(self.chk_reconnect)
         h.addStretch(1)
         return w
 
@@ -939,19 +1138,18 @@ class MainWindow(QMainWindow):
         self.tn_host = QLineEdit("192.168.1.1")
         self.tn_host.setFixedWidth(150)
         self.tn_port = QLineEdit("23")
-        self.tn_port.setFixedWidth(64)
-        self.tn_ping = QCheckBox("Ping first · auto-reconnect")
-        self.tn_ping.setToolTip("Waits until the host answers ping, then connects.\n"
-                                "If the host goes away it reconnects by itself.")
+        self.tn_port.setFixedWidth(60)
+        self.tn_ping = QCheckBox()
+        self._tr(self.tn_ping, "Ping first · auto-reconnect")
         self.tn_interval = QComboBox()
         self.tn_interval.addItems(["1", "2", "3", "5", "10"])
         self.tn_interval.setCurrentText("2")
         h.addWidget(self._field("IP"))
         h.addWidget(self.tn_host)
-        h.addSpacing(8)
+        h.addSpacing(6)
         h.addWidget(self._field("Port"))
         h.addWidget(self.tn_port)
-        h.addSpacing(16)
+        h.addSpacing(14)
         h.addWidget(self.tn_ping)
         h.addWidget(self._field("every"))
         h.addWidget(self.tn_interval)
@@ -964,7 +1162,7 @@ class MainWindow(QMainWindow):
         self.ssh_host = QLineEdit("192.168.1.1")
         self.ssh_host.setFixedWidth(150)
         self.ssh_port = QLineEdit("22")
-        self.ssh_port.setFixedWidth(64)
+        self.ssh_port.setFixedWidth(60)
         self.ssh_user = QLineEdit("root")
         self.ssh_user.setFixedWidth(110)
         self.ssh_pass = QLineEdit()
@@ -974,11 +1172,11 @@ class MainWindow(QMainWindow):
                          ("User", self.ssh_user), ("Password", self.ssh_pass)):
             h.addWidget(self._field(lbl))
             h.addWidget(wid)
-            h.addSpacing(8)
+            h.addSpacing(6)
         saved = load_saved_passwords_readonly()
         if saved:
             self.saved_cb = QComboBox()
-            self.saved_cb.addItem("Saved passwords…")
+            self.saved_cb.addItem(T("Saved passwords…"))
             for e in saved:
                 self.saved_cb.addItem(e["label"], e["password"])
             self.saved_cb.activated.connect(
@@ -987,12 +1185,18 @@ class MainWindow(QMainWindow):
         h.addStretch(1)
         return w
 
+    def _protocol_changed(self, i):
+        self.stack.setCurrentIndex(i)
+        self._fill_conn_profiles()
+        self.refresh_quick()
+
+    # ── quick commands card: GROUP → tab → commands ──────────────────────────
     def _build_quick(self):
-        """Quick commands bar — shows ONLY the commands of the selected protocol."""
-        card = self._card()
+        card = self._card("quick")
         v = QVBoxLayout(card)
         v.setContentsMargins(14, 10, 14, 10)
         v.setSpacing(8)
+
         top = QHBoxLayout()
         top.setSpacing(8)
         sec = QWidget()
@@ -1000,15 +1204,44 @@ class MainWindow(QMainWindow):
         sh = QHBoxLayout(sec)
         sh.setContentsMargins(0, 0, 0, 0)
         sh.setSpacing(6)
-        self.sec_quick = self._section("QUICK CMD")
+        self.sec_quick = self._section("QUICK CMD", "quick")
         sh.addWidget(self.sec_quick)
         self.proto_badge = QLabel("SERIAL")
         self.proto_badge.setObjectName("badge")
         sh.addWidget(self.proto_badge, 0, Qt.AlignVCenter)
         sh.addStretch(1)
         top.addWidget(sec)
-        top.addSpacing(2)
+        top.addSpacing(8)
+        self.group_bar = QHBoxLayout()               # big group pills
+        self.group_bar.setSpacing(6)
+        top.addLayout(self.group_bar)
+        self.btn_add_group = self._btn("＋ Group", "addchip", "New group (a big set of tabs)", self.qc_new_group)
+        top.addWidget(self.btn_add_group)
+        top.addStretch(1)
+        top.addWidget(self._field("Line end"))
+        self.ending_cb = QComboBox()
+        self.ending_cb.addItems(["CR+LF", "CR", "LF", "None"])
+        self.ending_cb.setCurrentText(str(self.settings.value("quick_ending", "CR+LF")))
+        self.ending_cb.currentTextChanged.connect(lambda t_: self.settings.setValue("quick_ending", t_))
+        self._tr(self.ending_cb, "Added after every quick command / test step", "tip")
+        top.addWidget(self.ending_cb)
+        self.btn_edit = self._btn("✏  Edit", "tool", "Edit mode: click a group, tab or command to change it")
+        self.btn_edit.setCheckable(True)
+        self.btn_edit.toggled.connect(self._edit_mode_changed)
+        top.addWidget(self.btn_edit)
+        imp = self._btn("Import", "tool", "Bring quick commands in from the old program or from an exported file")
+        imp.setProperty("hasMenu", True)
+        self.imp_menu = QMenu(imp)
+        imp.setMenu(self.imp_menu)
+        top.addWidget(imp)
+        top.addWidget(self._btn("Export", "tool",
+                                "Save ALL quick commands (every protocol) to a file — e.g. to copy to another PC",
+                                self.qc_export))
+        v.addLayout(top)
 
+        tabrow = QHBoxLayout()
+        tabrow.setSpacing(6)
+        tabrow.addSpacing(self.SECTION_W + 8)
         self.qtabs = QTabBar()
         self.qtabs.setObjectName("qtabs")
         self.qtabs.setExpanding(False)
@@ -1018,38 +1251,22 @@ class MainWindow(QMainWindow):
         self.qtabs.setCursor(Qt.PointingHandCursor)
         self.qtabs.setContextMenuPolicy(Qt.CustomContextMenu)
         self.qtabs.customContextMenuRequested.connect(self._tab_menu)
-        self.qtabs.currentChanged.connect(self._profile_changed)
-        self.qtabs.tabBarDoubleClicked.connect(lambda i: self.qc_rename_tab())
-        self.qtabs.setToolTip("Right-click a tab: rename / delete / move")
-        top.addWidget(self.qtabs)
-        new_tab = QPushButton("＋ Tab")
-        new_tab.setToolTip("New tab")
-        new_tab.clicked.connect(self.qc_new_tab)
-        top.addWidget(new_tab)
-        top.addStretch(1)
-        add_btn = QPushButton("＋ Command")
-        add_btn.setObjectName("primary")
-        add_btn.clicked.connect(self.qc_add)
-        top.addWidget(add_btn)
-        imp = QPushButton("Import")
-        imp.setObjectName("tool")
-        imp.setProperty("hasMenu", True)
-        imp.setToolTip("Bring quick commands in from the old program or from an exported file")
-        im = QMenu(imp)
-        im.addAction("From the old program (quick_commands.json)…", self.qc_import_old)
-        im.addAction("From an exported file…", self.qc_import_file)
-        imp.setMenu(im)
-        top.addWidget(imp)
-        exp = QPushButton("Export")
-        exp.setObjectName("tool")
-        exp.setToolTip("Save ALL quick commands (every protocol) to a file — e.g. to copy to another PC")
-        exp.clicked.connect(self.qc_export)
-        top.addWidget(exp)
-        v.addLayout(top)
+        self.qtabs.currentChanged.connect(self._tab_changed)
+        self.qtabs.tabBarClicked.connect(self._tab_clicked)
+        tabrow.addWidget(self.qtabs)
+        self.btn_add_tab = self._btn("＋ Tab", "addchip", "New tab inside this group", self.qc_new_tab)
+        tabrow.addWidget(self.btn_add_tab)
+        tabrow.addStretch(1)
+        self.edit_hint = QLabel()
+        self.edit_hint.setObjectName("edithint")
+        self._tr(self.edit_hint, "Edit mode — click a group, tab or command to rename, move or delete it")
+        self.edit_hint.setVisible(False)
+        tabrow.addWidget(self.edit_hint)
+        v.addLayout(tabrow)
 
         body = QHBoxLayout()
         body.setSpacing(10)
-        body.addSpacing(self.SECTION_W + 10)
+        body.addSpacing(self.SECTION_W + 8)
         cont = QWidget()
         cont.setObjectName("qcont")
         self.quick_flow = FlowLayout(cont, spacing=6)
@@ -1061,10 +1278,13 @@ class MainWindow(QMainWindow):
         self.quick_scroll.viewport().setAutoFillBackground(False)
         cont.setAutoFillBackground(False)
         body.addWidget(self.quick_scroll, 1)
+        v.addLayout(body)
         self.quick_empty = QLabel()
         self.quick_empty.setObjectName("empty")
-        body.addWidget(self.quick_empty, 1)
-        v.addLayout(body)
+        empty_row = QHBoxLayout()
+        empty_row.addSpacing(self.SECTION_W + 8)
+        empty_row.addWidget(self.quick_empty, 1)
+        v.addLayout(empty_row)
         return card
 
     def _fit_quick(self):
@@ -1072,64 +1292,29 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "quick_scroll"):
             return
         w = max(200, self.quick_scroll.viewport().width())
-        need = self.quick_flow.heightForWidth(w) if self.quick_buttons else 0
-        self.quick_scroll.setFixedHeight(min(max(need, 34), 112) + 2)
+        need = self.quick_flow.heightForWidth(w) if self.quick_flow.count() else 0
+        self.quick_scroll.setFixedHeight(min(max(need, 30), 100) + 2)
 
     def resizeEvent(self, ev):
         super().resizeEvent(ev)
         QTimer.singleShot(0, self._fit_quick)
 
-    def _build_send(self):
-        card = self._card()
-        h = QHBoxLayout(card)
-        h.setContentsMargins(14, 8, 14, 8)
-        h.setSpacing(10)
-        h.addWidget(self._section("SEND", self.SECTION_W))
-        self.send_edit = QLineEdit()
-        self.send_edit.setPlaceholderText("Type a command and press Enter  (↑ / ↓ = history)")
-        self.send_edit.setFont(self._mono(9))
-        self.send_edit.returnPressed.connect(self.send_custom)
-        self.send_edit.installEventFilter(self)
-        self.ending_cb = QComboBox(); self.ending_cb.addItems(["CR+LF", "CR", "LF", "None"])
-        self.btn_send = QPushButton("▶  Send")
-        self.btn_send.setObjectName("primary")
-        self.btn_send.setMinimumWidth(100)
-        self.btn_send.setEnabled(False)
-        self.btn_send.clicked.connect(self.send_custom)
-        h.addWidget(self.send_edit, 1)
-        h.addWidget(self.ending_cb)
-        h.addWidget(self.btn_send)
-        return card
-
+    # ── output card: Terminal | Log | Hex ────────────────────────────────────
     def _build_log_area(self):
-        card = self._card()
+        card = self._card("out")
         v = QVBoxLayout(card)
         v.setContentsMargins(14, 10, 14, 12)
         v.setSpacing(8)
         tools = QHBoxLayout()
-        tools.setSpacing(10)
-        self.sec_log = self._section("OUTPUT", self.SECTION_W)
+        tools.setSpacing(8)
+        self.sec_log = self._section("OUTPUT", "out", self.SECTION_W)
         tools.addWidget(self.sec_log)
-
-        vseg = QFrame()
-        vseg.setObjectName("segbar")
-        vl = QHBoxLayout(vseg)
-        vl.setContentsMargins(3, 3, 3, 3)
-        vl.setSpacing(2)
-        self.view_group = QButtonGroup(self)
-        for i, (name, tip) in enumerate((
-                ("Terminal", "Type directly like Tera Term — every key goes to the device"),
-                ("Log", "Line log with filter and colours"))):
-            b = QPushButton(name)
-            b.setCheckable(True)
-            b.setProperty("seg", True)
-            b.setCursor(Qt.PointingHandCursor)
-            b.setToolTip(tip)
-            self.view_group.addButton(b, i)
-            vl.addWidget(b)
-        self.view_group.idClicked.connect(self._set_view)
+        vseg, self.view_group = self._seg((
+            ("Terminal", "Type directly like Tera Term — every key goes to the device"),
+            ("Log", "Line log with filter and colours"),
+            ("Hex", "Raw bytes received (RX) and sent (TX)")), "out", self._set_view)
         tools.addWidget(vseg)
-        tools.addSpacing(8)
+        tools.addSpacing(6)
 
         self.tool_stack = QStackedWidget()
         tw, th = self._row()                       # terminal options (Tera Term names)
@@ -1137,46 +1322,52 @@ class MainWindow(QMainWindow):
         self.enter_cb = QComboBox()
         self.enter_cb.addItems(list(ENTER_CODES))
         th.addWidget(self.enter_cb)
-        th.addSpacing(6)
+        th.addSpacing(4)
         th.addWidget(self._field("Backspace"))
         self.bs_cb = QComboBox()
         self.bs_cb.addItems(list(BS_CODES))
         th.addWidget(self.bs_cb)
-        th.addSpacing(6)
-        self.chk_echo = QCheckBox("Local echo")
-        self.chk_echo.setToolTip("Show what you type yourself (only if the device does not echo)")
+        th.addSpacing(4)
+        self.chk_echo = QCheckBox()
+        self._tr(self.chk_echo, "Local echo")
         th.addWidget(self.chk_echo)
         self.chk_lf = QCheckBox("LF → CR+LF")
-        self.chk_lf.setToolTip("Treat a received LF as new line (fixes 'staircase' text)")
         th.addWidget(self.chk_lf)
-        self.btn_break = QPushButton("Break")
-        self.btn_break.setToolTip("Send serial BREAK (Tera Term: Alt+B)")
+        self.btn_break = self._btn("Break", None, "Send serial BREAK (Tera Term: Alt+B)", self.send_break)
         self.btn_break.setEnabled(False)
-        self.btn_break.clicked.connect(self.send_break)
         th.addWidget(self.btn_break)
-        hint = QLabel("select = copy · right-click = paste")
-        hint.setObjectName("hint")
-        th.addSpacing(6)
-        th.addWidget(hint)
+        self.btn_xfer = self._btn("Send file…", None, "Send file (XMODEM / YMODEM)…", self.open_transfer)
+        self.btn_xfer.setEnabled(False)
+        th.addWidget(self.btn_xfer)
         th.addStretch(1)
+        hint = QLabel()
+        hint.setObjectName("hint")
+        self._tr(hint, "select = copy · right-click = paste")
+        th.addWidget(hint)
         lw, lh = self._row()                       # log options
         lh.addWidget(self._field("Filter"))
         self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("show only lines containing…")
+        self._tr(self.filter_edit, "show only lines containing…", "placeholder")
         self.filter_edit.setFixedWidth(240)
         self.filter_edit.textChanged.connect(self.rerender)
         lh.addWidget(self.filter_edit)
         lh.addSpacing(10)
-        self.chk_scroll = QCheckBox("Auto Scroll"); self.chk_scroll.setChecked(True)
+        self.chk_scroll = QCheckBox()
+        self._tr(self.chk_scroll, "Auto Scroll")
+        self.chk_scroll.setChecked(True)
         lh.addWidget(self.chk_scroll)
         lh.addStretch(1)
-        self.tool_stack.addWidget(tw)
-        self.tool_stack.addWidget(lw)
+        hw, hh = self._row()                       # hex options
+        hint2 = QLabel()
+        hint2.setObjectName("hint")
+        self._tr(hint2, "Raw bytes received (RX) and sent (TX)")
+        hh.addWidget(hint2)
+        hh.addStretch(1)
+        for page in (tw, lw, hw):
+            self.tool_stack.addWidget(page)
         tools.addWidget(self.tool_stack, 1)
-        save = QPushButton("Save"); save.clicked.connect(self.save_output)
-        clear = QPushButton("Clear"); clear.clicked.connect(self.clear_output)
-        tools.addWidget(save)
-        tools.addWidget(clear)
+        tools.addWidget(self._btn("Save", None, None, self.save_output))
+        tools.addWidget(self._btn("Clear", None, None, self.clear_output))
         v.addLayout(tools)
 
         self.view_stack = QStackedWidget()
@@ -1195,8 +1386,14 @@ class MainWindow(QMainWindow):
         self.log.setMaximumBlockCount(MAX_LOG_LINES)
         self.log.setLineWrapMode(QPlainTextEdit.WidgetWidth)
         self.log.setFont(self._mono(9))
-        self.view_stack.addWidget(frame)
-        self.view_stack.addWidget(self.log)
+        self.hex = QPlainTextEdit()
+        self.hex.setObjectName("log")
+        self.hex.setReadOnly(True)
+        self.hex.setMaximumBlockCount(20000)
+        self.hex.setLineWrapMode(QPlainTextEdit.NoWrap)
+        self.hex.setFont(self._mono(9))
+        for page in (frame, self.log, self.hex):
+            self.view_stack.addWidget(page)
         v.addWidget(self.view_stack, 1)
 
         # restore terminal options (defaults = Tera Term defaults)
@@ -1218,8 +1415,8 @@ class MainWindow(QMainWindow):
         self._set_view(self.VIEW_LOG)          # the program always opens in the Log view
         return card
 
-    # ── terminal view ────────────────────────────────────────────────────────
-    VIEW_TERMINAL, VIEW_LOG = 0, 1
+    # ── output views ─────────────────────────────────────────────────────────
+    VIEW_TERMINAL, VIEW_LOG, VIEW_HEX = 0, 1, 2
 
     def _set_view(self, i):
         if self.view_group.checkedId() != i:
@@ -1242,10 +1439,12 @@ class MainWindow(QMainWindow):
 
     def _term_send(self, data):
         if self.session is None or not self.opened:
-            self._status("Not connected — press Connect first")
+            self._status(T("Not connected — press Connect first"))
             return
         ok, err = self.session.send(data)
-        if not ok:
+        if ok:
+            self._hex_add("TX", data)
+        else:
             self._status(f"Send error: {err}")
 
     def _term_resized(self, cols, rows):
@@ -1255,6 +1454,17 @@ class MainWindow(QMainWindow):
     def _on_data(self, token, data):
         if token is self.token:
             self.term.feed(data)
+            self._hex_add("RX", data)
+
+    def _hex_add(self, direction, data):
+        stamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        for off in range(0, len(data), 16):
+            chunk = data[off:off + 16]
+            hx = " ".join(f"{b:02X}" for b in chunk)
+            asc = "".join(chr(b) if 32 <= b < 127 else "." for b in chunk)
+            self._hex_pending.append(f"{stamp}  {direction}  {hx:<47}  |{asc}|")
+        if not self._flush_timer.isActive():
+            self._flush_timer.start()
 
     def _status(self, msg):
         self.status_msg.setText(msg)
@@ -1269,24 +1479,29 @@ class MainWindow(QMainWindow):
         return self.view_stack.currentIndex() == self.VIEW_TERMINAL
 
     def clear_output(self):
-        if self._in_terminal():
+        i = self.view_stack.currentIndex()
+        if i == self.VIEW_TERMINAL:
             self.term.clear()
+        elif i == self.VIEW_HEX:
+            self.hex.clear()
         else:
             self.clear_log()
 
     def save_output(self):
-        if not self._in_terminal():
+        i = self.view_stack.currentIndex()
+        if i == self.VIEW_LOG:
             self.save_log()
             return
-        default = os.path.join(os.path.expanduser("~"), "Documents",
-                               time.strftime("terminal_%Y%m%d_%H%M%S.txt"))
-        path, _ = QFileDialog.getSaveFileName(self, "Save terminal", default, "Text (*.txt);;All (*.*)")
+        name = "terminal" if i == self.VIEW_TERMINAL else "hex"
+        default = os.path.join(self._docs_dir(), time.strftime(f"{name}_%Y%m%d_%H%M%S.txt"))
+        path, _ = QFileDialog.getSaveFileName(self, T("Save"), default, "Text (*.txt);;All (*.*)")
         if not path:
             return
+        text = self.term.select_all_text() if i == self.VIEW_TERMINAL else self.hex.toPlainText()
         try:
             with open(path, "w", encoding="utf-8") as f:
-                f.write(self.term.select_all_text() + "\n")
-            self._status(f"Saved terminal → {os.path.basename(path)}")
+                f.write(text + "\n")
+            self._status(f"Saved → {os.path.basename(path)}")
         except OSError as e:
             self._status(f"Save failed: {e}")
 
@@ -1297,20 +1512,6 @@ class MainWindow(QMainWindow):
         f.setPointSize(size)
         f.setStyleHint(QFont.Monospace)
         return f
-
-    def eventFilter(self, obj, ev):          # ↑ / ↓ command history
-        from PySide6.QtCore import QEvent
-        if obj is self.send_edit and ev.type() == QEvent.KeyPress and self.history:
-            if ev.key() == Qt.Key_Up:
-                self.hist_idx = len(self.history) - 1 if self.hist_idx == -1 else max(0, self.hist_idx - 1)
-                self.send_edit.setText(self.history[self.hist_idx]); return True
-            if ev.key() == Qt.Key_Down and self.hist_idx != -1:
-                if self.hist_idx < len(self.history) - 1:
-                    self.hist_idx += 1; self.send_edit.setText(self.history[self.hist_idx])
-                else:
-                    self.hist_idx = -1; self.send_edit.clear()
-                return True
-        return super().eventFilter(obj, ev)
 
     # ── theme ────────────────────────────────────────────────────────────────
     @staticmethod
@@ -1354,7 +1555,7 @@ class MainWindow(QMainWindow):
             self.term.set_colors(self.pal["BG"], self.pal["TEXT"], self.pal["ACCENT"],
                                  dark=name not in LIGHT_THEMES)
             # pass / fail / error / warning lines get the same colours as in the Log view
-            self.term.set_highlight(auto_tag, {"error": self.pal["WARN"], "warn": self.pal["YELLOW"],
+            self.term.set_highlight(self.classify, {"error": self.pal["WARN"], "warn": self.pal["YELLOW"],
                                                "success": self.pal["ACCENT2"]})
         if hasattr(self, "log"):
             self.rerender()
@@ -1364,7 +1565,10 @@ class MainWindow(QMainWindow):
     # ── log ──────────────────────────────────────────────────────────────────
     def _fmt(self, tag):
         f = QTextCharFormat()
-        key = {"info": "TEXT", "warn": "YELLOW", "error": "WARN", "success": "ACCENT2"}[tag]
+        if tag.startswith("c:"):                   # user highlight word
+            f.setForeground(QColor(tag[2:]))
+            return f
+        key = {"info": "TEXT", "warn": "YELLOW", "error": "WARN", "success": "ACCENT2"}.get(tag, "TEXT")
         f.setForeground(QColor(self.pal[key]))
         return f
 
@@ -1389,12 +1593,17 @@ class MainWindow(QMainWindow):
 
     def _enqueue(self, text, tag, is_sys):
         self.log_lines.append((text, tag, is_sys))
+        if self.logfile is not None:
+            self.logfile.write(text, is_sys)
         if self._passes(text):
             self._pending.append((text, tag, is_sys))
             if not self._flush_timer.isActive():
                 self._flush_timer.start()
 
     def _flush(self):
+        if self._hex_pending:
+            lines, self._hex_pending = self._hex_pending, []
+            self.hex.appendPlainText("\n".join(lines))
         if not self._pending:
             self._flush_timer.stop()
             return
@@ -1410,7 +1619,17 @@ class MainWindow(QMainWindow):
             self._status(msg)
 
     def add_line(self, text):
-        self._enqueue(text, auto_tag(text), False)
+        tag = self.classify(text)
+        self._enqueue(text, tag, False)
+        if tag == "error" and self._setting_on("beep_fail", "false") and time.time() - self._last_beep > 1.5:
+            self._last_beep = time.time()
+            try:
+                import winsound
+                winsound.MessageBeep(winsound.MB_ICONHAND)
+            except Exception:
+                QApplication.beep()
+        if self.test_win is not None:
+            self.test_win.feed_line(text)
 
     def rerender(self, *_):
         self._pending = []
@@ -1429,7 +1648,7 @@ class MainWindow(QMainWindow):
     def save_log(self):
         default = os.path.join(os.path.expanduser("~"), "Documents",
                                time.strftime("uart_log_%Y%m%d_%H%M%S.txt"))
-        path, _ = QFileDialog.getSaveFileName(self, "Save log", default, "Text (*.txt);;All (*.*)")
+        path, _ = QFileDialog.getSaveFileName(self, T("Save"), default, "Text (*.txt);;All (*.*)")
         if not path:
             return
         try:
@@ -1441,15 +1660,36 @@ class MainWindow(QMainWindow):
             self.log_sys(f"Save failed: {e}", "error")
 
     # ── serial ───────────────────────────────────────────────────────────────
-    def refresh_ports(self):
-        ports = [p.device for p in serial.tools.list_ports.comports()]
-        keep = self.port_cb.currentText()
+    def refresh_ports(self, announce=False, select=None):
+        ports = list_ports()
+        keep = select or self.port_cb.currentData()
+        self.port_cb.blockSignals(True)
         self.port_cb.clear()
-        self.port_cb.addItems(ports)
-        if keep in ports:
-            self.port_cb.setCurrentText(keep)
-        if hasattr(self, "log"):
-            self.log_sys(f"Found {len(ports)} port(s): {', '.join(ports) if ports else 'none'}")
+        for dev, desc in ports:
+            self.port_cb.addItem(f"{dev}  —  {desc}" if desc else dev, dev)
+        idx = self.port_cb.findData(keep)
+        if idx >= 0:
+            self.port_cb.setCurrentIndex(idx)
+        self.port_cb.blockSignals(False)
+        self._known_ports = {d for d, _ in ports}
+        if announce and hasattr(self, "log"):
+            self.log_sys(f"Found {len(ports)} port(s): {', '.join(d for d, _ in ports) if ports else 'none'}")
+
+    def _poll_ports(self):
+        """Every 2 s: notice a plugged / unplugged USB-UART (only while idle)."""
+        if self.session is not None:
+            return
+        try:
+            now = {d for d, _ in list_ports()}
+        except Exception:
+            return
+        if self._known_ports is None or now == self._known_ports:
+            return
+        new = sorted(now - self._known_ports)
+        self.refresh_ports(select=new[0] if new else None)
+        if new:
+            desc = self.port_cb.currentText()
+            self._status(f"New port: {desc}")
 
     def _set_pill(self, text, state):
         self.pill.setText(text)
@@ -1471,7 +1711,7 @@ class MainWindow(QMainWindow):
                 on_data=lambda b: self.sig_data.emit(token, b))
         try:
             if kind == 0:
-                port = self.port_cb.currentText()
+                port = self.port_cb.currentData()
                 if not port:
                     return None, "Select a COM port first."
                 parity = {"None": serial.PARITY_NONE, "Even": serial.PARITY_EVEN,
@@ -1479,7 +1719,8 @@ class MainWindow(QMainWindow):
                           "Space": serial.PARITY_SPACE}[self.parity_cb.currentText()]
                 return SerialSession(port, int(self.baud_cb.currentText()),
                                      int(self.data_cb.currentText()), parity,
-                                     float(self.stop_cb.currentText()), **cbs()), ""
+                                     float(self.stop_cb.currentText()),
+                                     auto_reconnect=self.chk_reconnect.isChecked(), **cbs()), ""
             if kind == 1:
                 host = self.tn_host.text().strip()
                 if not host:
@@ -1508,7 +1749,7 @@ class MainWindow(QMainWindow):
         self.session = sess
         self.opened = False
         self._set_ui_state("connecting")
-        self._set_pill(f"●  Connecting… {sess.label}", "busy")
+        self._set_pill(f"●  {T('Connecting…')} {sess.label}", "busy")
         self.log_sys(f"Connecting → {sess.label}")
         self.term.write_banner(f"Connecting  {sess.label}")
         sess.start()
@@ -1520,8 +1761,9 @@ class MainWindow(QMainWindow):
             self.log_sys(f"Disconnected ({sess.kind})", "warn")
             self.term.write_banner(f"Disconnected  {sess.label}")
         self.opened = False
+        self._stop_logfile()
         self._set_ui_state("idle")
-        self._set_pill("●  Disconnected", "off")
+        self._set_pill(T("●  Disconnected"), "off")
         self.status_port.setText("")
 
     # signals arrive on the GUI thread; `token` filters out stale sessions
@@ -1532,6 +1774,7 @@ class MainWindow(QMainWindow):
         self._set_ui_state("connected")
         self._set_pill(f"●  {self.session.label}", "on")
         self.status_port.setText(self.session.label)
+        self._start_logfile(self.session.label)
         self.log_sys(f"Connected → {self.session.label}", "success")
         self.term.write_banner(f"Connected  {self.session.label}", "green")
         if self._in_terminal():
@@ -1543,9 +1786,10 @@ class MainWindow(QMainWindow):
         kind = self.session.kind
         self.session, self.token, self.opened = None, None, False
         self._set_ui_state("idle")
-        self._set_pill("●  Disconnected", "err" if error else "off")
+        self._set_pill(T("●  Disconnected"), "err" if error else "off")
         self.status_port.setText("")
         self.log_sys(reason or f"{kind} session ended", "error" if error else "warn")
+        self._stop_logfile()
         self.term.write_banner(reason or f"{kind} session ended", "red" if error else "brightblack")
 
     def _on_info(self, token, text, tag):
@@ -1562,9 +1806,10 @@ class MainWindow(QMainWindow):
         up = state == "connected"
         self.btn_connect.setEnabled(idle)
         self.btn_disconnect.setEnabled(not idle)
-        self.btn_send.setEnabled(up)
         self.term.online = up
         self.btn_break.setEnabled(up and isinstance(self.session, SerialSession))
+        self.btn_xfer.setEnabled(up)
+        self.prof_cb.setEnabled(idle)
         for b in self.seg_group.buttons():          # protocol is locked while a session exists
             b.setEnabled(idle or b is self.seg_group.checkedButton())
         for b in self.quick_buttons:
@@ -1580,17 +1825,32 @@ class MainWindow(QMainWindow):
         if self.session is None or not self.opened:
             self.log_sys("Not connected.", "warn")
             return False
-        ok, err = self.session.send(text.encode("utf-8") + self._ending())
+        data = text.encode("utf-8") + self._ending()
+        ok, err = self.session.send(data)
         self.log_sys(f"TX → {text}" if ok else f"Send error: {err}", "info" if ok else "error")
+        if ok:
+            self._hex_add("TX", data)
         return ok
 
-    def send_custom(self):
-        text = self.send_edit.text().strip()
-        if text and self._send(text):
-            if not self.history or self.history[-1] != text:
-                self.history.append(text)
-            self.hist_idx = -1
-            self.send_edit.clear()
+    # ── automatic log files ──────────────────────────────────────────────────
+    def _start_logfile(self, label):
+        self._stop_logfile()
+        if not self._setting_on("log_auto", "true"):
+            return
+        try:
+            self.logfile = LogWriter(self._log_dir(), label)
+            self.rec_lbl.setText("● REC  " + os.path.basename(self.logfile.path))
+            self.rec_lbl.setToolTip(self.logfile.path)
+        except OSError as e:
+            self.logfile = None
+            self.log_sys(f"Cannot write the log file: {e}", "error")
+
+    def _stop_logfile(self):
+        if self.logfile is not None:
+            self.logfile.close()
+            self.logfile = None
+        if hasattr(self, "rec_lbl"):
+            self.rec_lbl.setText("")
 
     def run_quick(self, cmd, idx=0, parts=None):
         if idx == 0 and self._in_terminal():
@@ -1603,7 +1863,7 @@ class MainWindow(QMainWindow):
         if idx + 1 < len(parts):
             QTimer.singleShot(300, lambda: self.run_quick(cmd, idx + 1, parts))
 
-    # ── quick commands (per protocol) ────────────────────────────────────────
+    # ── quick commands: protocol → GROUP → tab → commands ────────────────────
     def qproto(self):
         return PROTOCOLS[max(0, self.seg_group.checkedId())]
 
@@ -1611,46 +1871,47 @@ class MainWindow(QMainWindow):
         if err:
             self.log_sys(f"Could not save quick commands: {err}", "error")
 
-    def _fill_profiles(self):
+    def _edit_mode_changed(self, on):
+        self.edit_hint.setVisible(on)
+        self.render_quick()
+
+    def refresh_quick(self):
+        """Protocol (or its data) changed: rebuild groups, tabs and buttons."""
+        self.store.reload_if_changed()
         proto = self.qproto()
+        self.proto_badge.setText(proto.upper())
+        self.imp_menu.clear()
+        self.imp_menu.addAction(T("From the old program (quick_commands.json)…"), self.qc_import_old)
+        self.imp_menu.addAction(T("From an exported file…"), self.qc_import_file)
+        # group pills
+        while self.group_bar.count():
+            w = self.group_bar.takeAt(0).widget()
+            if w:
+                w.hide()
+                w.setParent(None)
+                w.deleteLater()
+        for i, g in enumerate(self.store.groups(proto)):
+            b = QPushButton(g["name"])
+            b.setObjectName("group")
+            b.setCheckable(True)
+            b.setChecked(i == self.store.active_group(proto))
+            b.setCursor(Qt.PointingHandCursor)
+            b.clicked.connect(lambda _=False, idx=i: self._group_clicked(idx))
+            b.setContextMenuPolicy(Qt.CustomContextMenu)
+            b.customContextMenuRequested.connect(
+                lambda pos, idx=i, btn=b: self._group_menu(idx, btn.mapToGlobal(pos)))
+            self.group_bar.addWidget(b)
+        # tabs of the active group
         self.qtabs.blockSignals(True)
         while self.qtabs.count():
             self.qtabs.removeTab(0)
-        for p in self.store.profiles(proto):
-            self.qtabs.addTab(p["name"])
+        for t_ in self.store.tabs(proto):
+            self.qtabs.addTab(t_["name"])
         if self.qtabs.count():
-            self.qtabs.setCurrentIndex(self.store.active(proto))
+            self.qtabs.setCurrentIndex(self.store.active_tab(proto))
         self.qtabs.setVisible(self.qtabs.count() > 0)
+        self.btn_add_tab.setVisible(bool(self.store.groups(proto)))
         self.qtabs.blockSignals(False)
-
-    def _profile_changed(self, idx):
-        if idx >= 0:
-            self._qc_error(self.store.set_active(self.qproto(), idx))
-            self.render_quick()
-
-    def _tab_menu(self, pos):
-        i = self.qtabs.tabAt(pos)
-        if i < 0:
-            return
-        self.qtabs.setCurrentIndex(i)
-        m = QMenu(self)
-        m.addAction("✎  Rename…", self.qc_rename_tab)
-        m.addAction("🗑  Delete tab", self.qc_delete_tab)
-        m.addSeparator()
-        m.addAction("◀  Move left", lambda: self.qc_move_tab(-1))
-        m.addAction("▶  Move right", lambda: self.qc_move_tab(+1))
-        m.addSeparator()
-        m.addAction("🧹  Delete ALL tabs of this protocol", self.qc_delete_all_tabs)
-        m.exec(self.qtabs.mapToGlobal(pos))
-
-    def qc_move_tab(self, delta):
-        self._qc_error(self.store.move_profile(self.qproto(), delta))
-        self.refresh_quick()
-
-    def refresh_quick(self):
-        """Protocol (or its data) changed: rebuild tab list + buttons."""
-        self.proto_badge.setText(self.qproto().upper())
-        self._fill_profiles()
         self.render_quick()
 
     def render_quick(self):
@@ -1663,52 +1924,174 @@ class MainWindow(QMainWindow):
         self.quick_buttons = []
         proto = self.qproto()
         cmds = self.store.cmds(proto)
-        if not self.store.has_tabs(proto):
-            msg = "No quick commands yet — press ＋ Command, or Import from the old program."
-        else:
-            msg = "This tab is empty — press ＋ Command to add one."
-        self.quick_empty.setText(msg)
-        self.quick_empty.setVisible(not cmds)
-        self.quick_scroll.setVisible(bool(cmds))
+        editing = self.btn_edit.isChecked()
         for i, c in enumerate(cmds):
-            b = QPushButton(c["label"])
+            b = QPushButton(("✎ " if editing else "") + c["label"])
             b.setObjectName("quick")
             b.setCursor(Qt.PointingHandCursor)
-            b.setToolTip(c["cmd"] + "\n\nRight-click: edit / delete / move")
+            b.setToolTip(c["cmd"])
             b.setProperty("offline", not self.opened)
-            b.clicked.connect(lambda _=False, cmd=c["cmd"]: self.run_quick(cmd))
+            b.setProperty("editing", editing)
+            b.clicked.connect(lambda _=False, idx=i, cmd=c["cmd"]:
+                              self.qc_edit(idx) if self.btn_edit.isChecked() else self.run_quick(cmd))
             b.setContextMenuPolicy(Qt.CustomContextMenu)
             b.customContextMenuRequested.connect(
                 lambda pos, idx=i, btn=b: self._quick_menu(idx, btn.mapToGlobal(pos)))
             self.quick_flow.addWidget(b)
             self.quick_buttons.append(b)
+        add = QPushButton(T("＋ Command"))
+        add.setObjectName("addchip")
+        add.setCursor(Qt.PointingHandCursor)
+        add.clicked.connect(self.qc_add)
+        self.quick_flow.addWidget(add)
+        if not self.store.groups(proto):
+            msg = T("No quick commands yet — press ＋ Command, or Import from the old program.")
+        elif not cmds:
+            msg = T("This tab is empty — press ＋ Command to add one.")
+        else:
+            msg = ""
+        self.quick_empty.setText(msg)
+        self.quick_empty.setVisible(bool(msg))
         self._fit_quick()
+
+    def _group_clicked(self, idx):
+        proto = self.qproto()
+        if self.btn_edit.isChecked() and idx == self.store.active_group(proto):
+            self._edit_item("group", idx)
+            return
+        self._qc_error(self.store.set_active_group(proto, idx))
+        self.refresh_quick()
+
+    def _tab_changed(self, idx):
+        if idx >= 0:
+            self._qc_error(self.store.set_active_tab(self.qproto(), idx))
+            self.render_quick()
+
+    def _tab_clicked(self, idx):
+        if self.btn_edit.isChecked() and idx >= 0 and idx == self.qtabs.currentIndex():
+            QTimer.singleShot(0, lambda: self._edit_item("tab", idx))
+
+    def _group_menu(self, idx, global_pos):
+        self._qc_error(self.store.set_active_group(self.qproto(), idx))
+        self.refresh_quick()
+        m = QMenu(self)
+        m.addAction("✎  " + T("Rename"), lambda: self._edit_item("group", idx))
+        m.addAction("◀  " + T("Up"), lambda: self._move_group(-1))
+        m.addAction("▶  " + T("Down"), lambda: self._move_group(+1))
+        m.addSeparator()
+        m.addAction("🗑  " + T("Delete"), self.qc_delete_group)
+        m.exec(global_pos)
+
+    def _tab_menu(self, pos):
+        i = self.qtabs.tabAt(pos)
+        if i < 0:
+            return
+        self.qtabs.setCurrentIndex(i)
+        m = QMenu(self)
+        m.addAction("✎  " + T("Rename"), lambda: self._edit_item("tab", i))
+        m.addAction("◀  " + T("Up"), lambda: self.qc_move_tab(-1))
+        m.addAction("▶  " + T("Down"), lambda: self.qc_move_tab(+1))
+        m.addSeparator()
+        m.addAction("🗑  " + T("Delete"), self.qc_delete_tab)
+        m.exec(self.qtabs.mapToGlobal(pos))
 
     def _quick_menu(self, idx, global_pos):
         m = QMenu(self)
-        m.addAction("✎  Edit…", lambda: self.qc_edit(idx))
-        m.addAction("🗑  Delete", lambda: self.qc_delete(idx))
+        m.addAction("✎  " + T("Rename") + " / " + T("Edit"), lambda: self.qc_edit(idx))
+        m.addAction("◀  " + T("Up"), lambda: self.qc_move(idx, -1))
+        m.addAction("▶  " + T("Down"), lambda: self.qc_move(idx, +1))
         m.addSeparator()
-        m.addAction("◀  Move earlier", lambda: self.qc_move(idx, -1))
-        m.addAction("▶  Move later", lambda: self.qc_move(idx, +1))
+        m.addAction("🗑  " + T("Delete"), lambda: self.qc_delete(idx))
         m.exec(global_pos)
 
+    def _edit_item(self, kind, idx):
+        """Edit-mode dialog for a group or tab: rename / move / delete."""
+        proto = self.qproto()
+        items = self.store.groups(proto) if kind == "group" else self.store.tabs(proto)
+        if not 0 <= idx < len(items):
+            return
+        dlg = NameEditDialog(self, T("Group") if kind == "group" else T("Tab"), items[idx]["name"])
+        if not dlg.exec():
+            return
+        act = dlg.action
+        if kind == "group":
+            if act == "delete":
+                self.qc_delete_group()
+            elif act in ("left", "right"):
+                self._move_group(-1 if act == "left" else +1)
+            elif dlg.value():
+                self._qc_error(self.store.rename_group(proto, dlg.value()))
+        else:
+            if act == "delete":
+                self.qc_delete_tab()
+            elif act in ("left", "right"):
+                self.qc_move_tab(-1 if act == "left" else +1)
+            elif dlg.value():
+                self._qc_error(self.store.rename_tab(proto, dlg.value()))
+        self.refresh_quick()
+
+    def _move_group(self, delta):
+        self._qc_error(self.store.move_group(self.qproto(), delta))
+        self.refresh_quick()
+
+    def qc_new_group(self):
+        name, ok = QInputDialog.getText(self, T("＋ Group"), T("Group") + ":")
+        if ok and name.strip():
+            self._qc_error(self.store.add_group(self.qproto(), name.strip()))
+            self.refresh_quick()
+
+    def qc_delete_group(self):
+        proto = self.qproto()
+        gs = self.store.groups(proto)
+        if not gs:
+            return
+        name = gs[self.store.active_group(proto)]["name"]
+        if QMessageBox.question(self, T("Delete"), f"{T('Delete')} “{name}” ({T('Group')})?") == QMessageBox.Yes:
+            self._qc_error(self.store.delete_group(proto))
+            self.refresh_quick()
+
+    def qc_new_tab(self):
+        name, ok = QInputDialog.getText(self, T("＋ Tab"), T("Tab") + ":")
+        if ok and name.strip():
+            self._qc_error(self.store.add_tab(self.qproto(), name.strip()))
+            self.refresh_quick()
+
+    def qc_move_tab(self, delta):
+        self._qc_error(self.store.move_tab(self.qproto(), delta))
+        self.refresh_quick()
+
+    def qc_delete_tab(self):
+        proto = self.qproto()
+        tabs = self.store.tabs(proto)
+        if not tabs:
+            return
+        name = tabs[self.store.active_tab(proto)]["name"]
+        if QMessageBox.question(self, T("Delete"), f"{T('Delete')} “{name}” ({T('Tab')})?") == QMessageBox.Yes:
+            self._qc_error(self.store.delete_tab(proto))
+            self.refresh_quick()
+
     def qc_add(self):
-        dlg = CmdDialog(self, "Add command")
+        dlg = CmdDialog(self, T("＋ Command"))
         if dlg.exec():
             self._qc_error(self.store.add_cmd(self.qproto(), *dlg.values()))
-            self.refresh_quick()          # a "General" tab may have been created
+            self.refresh_quick()          # a "General" group / tab may have been created
 
     def qc_edit(self, idx):
         c = self.store.cmds(self.qproto())[idx]
-        dlg = CmdDialog(self, "Edit command", c["label"], c["cmd"])
-        if dlg.exec():
+        dlg = CmdDialog(self, T("Edit"), c["label"], c["cmd"], editing=True)
+        if not dlg.exec():
+            return
+        if dlg.action == "delete":
+            self.qc_delete(idx, ask=False)
+        elif dlg.action in ("left", "right"):
+            self.qc_move(idx, -1 if dlg.action == "left" else +1)
+        else:
             self._qc_error(self.store.edit_cmd(self.qproto(), idx, *dlg.values()))
             self.render_quick()
 
-    def qc_delete(self, idx):
+    def qc_delete(self, idx, ask=True):
         c = self.store.cmds(self.qproto())[idx]
-        if QMessageBox.question(self, "Delete command", f"Delete “{c['label']}”?") == QMessageBox.Yes:
+        if not ask or QMessageBox.question(self, T("Delete"), f"{T('Delete')} “{c['label']}”?") == QMessageBox.Yes:
             self._qc_error(self.store.delete_cmd(self.qproto(), idx))
             self.render_quick()
 
@@ -1716,43 +2099,17 @@ class MainWindow(QMainWindow):
         self._qc_error(self.store.move_cmd(self.qproto(), idx, delta))
         self.render_quick()
 
-    def qc_new_tab(self):
-        name, ok = QInputDialog.getText(self, "New tab", "Tab name:")
-        if ok and name.strip():
-            self._qc_error(self.store.add_profile(self.qproto(), name.strip()))
-            self.refresh_quick()
-
-    def qc_rename_tab(self):
-        if not self.store.has_tabs(self.qproto()):
-            return
-        cur = self.qtabs.tabText(self.qtabs.currentIndex())
-        name, ok = QInputDialog.getText(self, "Rename tab", "Tab name:", text=cur)
-        if ok and name.strip():
-            self._qc_error(self.store.rename_profile(self.qproto(), name.strip()))
-            self.refresh_quick()
-
-    def qc_delete_tab(self):
-        if not self.store.has_tabs(self.qproto()):
-            return
-        name = self.qtabs.tabText(self.qtabs.currentIndex())
-        if QMessageBox.question(self, "Delete tab",
-                                f"Delete tab “{name}” and all its commands?") != QMessageBox.Yes:
-            return
-        self._qc_error(self.store.delete_profile(self.qproto()))
-        self.refresh_quick()
-
     def _docs_dir(self):
         d = os.path.join(os.path.expanduser("~"), "Documents")
         return d if os.path.isdir(d) else os.path.expanduser("~")
 
     def qc_export(self):
-        n_tabs = sum(len(self.store.profiles(p)) for p in PROTOCOLS)
-        n_cmds = sum(len(t_["cmds"]) for p in PROTOCOLS for t_ in self.store.profiles(p))
+        n_tabs, n_cmds = self.store.counts()
         if not n_tabs:
-            QMessageBox.information(self, "Export", "There are no quick commands to export yet.")
+            QMessageBox.information(self, T("Export"), "There are no quick commands to export yet.")
             return
         default = os.path.join(self._docs_dir(), time.strftime("quick_commands_%Y%m%d.json"))
-        path, _ = QFileDialog.getSaveFileName(self, "Export quick commands", default,
+        path, _ = QFileDialog.getSaveFileName(self, T("Export"), default,
                                               "Quick commands (*.json);;All files (*.*)")
         if not path:
             return
@@ -1760,12 +2117,12 @@ class MainWindow(QMainWindow):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self.store.export_data(), f, ensure_ascii=False, indent=2)
         except OSError as e:
-            QMessageBox.warning(self, "Export", f"Could not write the file:\n{e}")
+            QMessageBox.warning(self, T("Export"), f"Could not write the file:\n{e}")
             return
         self.log_sys(f"Exported {n_tabs} tab(s), {n_cmds} command(s) → {path}", "success")
 
     def qc_import_file(self, start_dir=None):
-        path, _ = QFileDialog.getOpenFileName(self, "Import quick commands", start_dir or self._docs_dir(),
+        path, _ = QFileDialog.getOpenFileName(self, T("Import"), start_dir or self._docs_dir(),
                                               "Quick commands (*.json);;All files (*.*)")
         if path:
             self._import_from(path)
@@ -1778,7 +2135,7 @@ class MainWindow(QMainWindow):
                 self._import_from(cand)
                 return
         QMessageBox.information(
-            self, "Import from the old program",
+            self, T("Import"),
             "quick_commands.json of the old program was not found automatically.\n\n"
             "It is normally in the same folder as SuperSerial.py. Please choose it.")
         self.qc_import_file(os.path.join(os.path.expanduser("~"), "Desktop"))
@@ -1788,7 +2145,7 @@ class MainWindow(QMainWindow):
             with open(path, "r", encoding="utf-8-sig") as f:
                 kind, payload = detect_import(json.load(f))
         except (OSError, ValueError) as e:      # JSONDecodeError is a ValueError
-            QMessageBox.warning(self, "Import", f"Cannot import this file:\n{path}\n\n{e}")
+            QMessageBox.warning(self, T("Import"), f"Cannot import this file:\n{path}\n\n{e}")
             return
         dlg = ImportDialog(self, path, kind, payload, self.qproto())
         res = dlg.exec()
@@ -1801,11 +2158,15 @@ class MainWindow(QMainWindow):
         if replace:
             names = ", ".join(ImportDialog.LABELS[p] for p in targets)
             if QMessageBox.question(self, "Replace",
-                                    f"Remove all current tabs of {names} and import?") != QMessageBox.Yes:
+                                    f"Replace the quick commands of {names}?") != QMessageBox.Yes:
                 return
         tabs = cmds = 0
         for proto in targets:
-            a, b = self.store.import_profiles(proto, dlg.profiles_for(proto), replace)
+            if kind == "v3":
+                a, b = self.store.import_groups(proto, payload[proto], replace)
+            else:
+                group = "SuperSerial" if kind == "legacy" else None
+                a, b = self.store.import_tabs(proto, dlg.profiles_for(proto), replace, group_name=group)
             tabs, cmds = tabs + a, cmds + b
         self._qc_error(self.store.save())
         where = ", ".join(ImportDialog.LABELS[p] for p in targets)
@@ -1813,21 +2174,202 @@ class MainWindow(QMainWindow):
                      "success")
         self.refresh_quick()
 
-    def qc_delete_all_tabs(self):
+    # ── connection profiles ──────────────────────────────────────────────────
+    def _fill_conn_profiles(self):
         proto = self.qproto()
-        if not self.store.has_tabs(proto):
+        self.prof_cb.blockSignals(True)
+        self.prof_cb.clear()
+        self.prof_cb.addItem(T("Profile…"), None)
+        for n in self.profiles.names(proto):
+            self.prof_cb.addItem(n, n)
+        self.prof_cb.blockSignals(False)
+
+    def _conn_values(self, proto):
+        if proto == "serial":
+            return {"port": self.port_cb.currentData() or "", "baud": self.baud_cb.currentText(),
+                    "data": self.data_cb.currentText(), "parity": self.parity_cb.currentText(),
+                    "stop": self.stop_cb.currentText(), "auto": self.chk_reconnect.isChecked()}
+        if proto == "telnet":
+            return {"host": self.tn_host.text().strip(), "port": self.tn_port.text().strip(),
+                    "ping": self.tn_ping.isChecked(), "interval": self.tn_interval.currentText()}
+        return {"host": self.ssh_host.text().strip(), "port": self.ssh_port.text().strip(),
+                "user": self.ssh_user.text().strip()}
+
+    def _profile_selected(self, i):
+        name = self.prof_cb.itemData(i)
+        p = self.profiles.get(self.qproto(), name) if name else None
+        if not p:
             return
-        if QMessageBox.question(self, "Delete all tabs",
-                                f"Delete ALL {proto.upper()} tabs and their commands?") != QMessageBox.Yes:
+        proto = self.qproto()
+        if proto == "serial":
+            idx = self.port_cb.findData(p.get("port"))
+            if idx >= 0:
+                self.port_cb.setCurrentIndex(idx)
+            elif p.get("port"):
+                self._status(f"{p['port']} is not connected to this PC right now")
+            for cb, k in ((self.baud_cb, "baud"), (self.data_cb, "data"),
+                          (self.parity_cb, "parity"), (self.stop_cb, "stop")):
+                if p.get(k):
+                    cb.setCurrentText(str(p[k]))
+            self.chk_reconnect.setChecked(bool(p.get("auto", True)))
+        elif proto == "telnet":
+            self.tn_host.setText(str(p.get("host", "")))
+            self.tn_port.setText(str(p.get("port", "23")))
+            self.tn_ping.setChecked(bool(p.get("ping")))
+            self.tn_interval.setCurrentText(str(p.get("interval", "2")))
+        else:
+            self.ssh_host.setText(str(p.get("host", "")))
+            self.ssh_port.setText(str(p.get("port", "22")))
+            self.ssh_user.setText(str(p.get("user", "")))
+
+    def profile_save(self):
+        proto = self.qproto()
+        vals = self._conn_values(proto)
+        suggestion = self.prof_cb.currentData() or (
+            f"{vals['port']} {vals['baud']}" if proto == "serial" else vals.get("host", ""))
+        name, ok = QInputDialog.getText(self, T("Save profile"), T("Profile name:"), text=suggestion)
+        if ok and name.strip():
+            err = self.profiles.put(proto, name.strip(), vals)
+            if err:
+                self.log_sys(f"Could not save profile: {err}", "error")
+            self._fill_conn_profiles()
+            self.prof_cb.setCurrentIndex(max(0, self.prof_cb.findData(name.strip())))
+
+    def profile_delete(self):
+        name = self.prof_cb.currentData()
+        if name and QMessageBox.question(self, T("Delete profile"), f"{T('Delete profile')} “{name}”?") \
+                == QMessageBox.Yes:
+            self.profiles.delete(self.qproto(), name)
+            self._fill_conn_profiles()
+
+    # ── settings / tools / help ──────────────────────────────────────────────
+    def _setting_on(self, key, default):
+        return str(self.settings.value(key, default)).lower() == "true"
+
+    def _log_dir(self):
+        return str(self.settings.value("log_dir", "") or default_log_dir())
+
+    def _rules(self):
+        try:
+            rules = json.loads(str(self.settings.value("hl_rules", "[]")))
+            return rules if isinstance(rules, list) else []
+        except ValueError:
+            return []
+
+    def classify(self, text):
+        """Line colour tag: user highlight words first, then pass / fail / warning."""
+        for r in self._compiled_rules:
+            if r[0](text):
+                return r[1]
+        return auto_tag(text)
+
+    def _compile_rules(self):
+        out = []
+        for r in self._rules():
+            t_, color = r.get("text", ""), r.get("color", "#58a6ff")
+            if not t_:
+                continue
+            if r.get("regex"):
+                try:
+                    rx = re.compile(t_, re.I)
+                    out.append((lambda s, rx=rx: bool(rx.search(s)), "c:" + color))
+                except re.error:
+                    continue
+            else:
+                low = t_.lower()
+                out.append((lambda s, low=low: low in s.lower(), "c:" + color))
+        self._compiled_rules = out
+
+    def open_settings(self):
+        vals = {"log_auto": self._setting_on("log_auto", "true"), "log_dir": self._log_dir(),
+                "beep": self._setting_on("beep_fail", "false"), "rules": self._rules(),
+                "channel": str(self.settings.value("update_channel", "stable")),
+                "auto_update": self._setting_on("auto_update", "true")}
+        dlg = SettingsDialog(self, vals)
+        if not dlg.exec():
             return
-        self._qc_error(self.store.delete_all_profiles(proto))
-        self.refresh_quick()
+        v = dlg.values()
+        st = self.settings
+        st.setValue("log_auto", "true" if v["log_auto"] else "false")
+        st.setValue("log_dir", v["log_dir"] or default_log_dir())
+        st.setValue("beep_fail", "true" if v["beep"] else "false")
+        st.setValue("hl_rules", json.dumps(v["rules"], ensure_ascii=False))
+        st.setValue("update_channel", v["channel"])
+        st.setValue("auto_update", "true" if v["auto_update"] else "false")
+        self._compile_rules()
+        self.rerender()
+        self.term.update()
+        self._status(T("Settings") + " ✔")
+
+    def _open_folder(self, path):
+        os.makedirs(path, exist_ok=True)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+
+    def open_new_window(self):
+        exe = updater.running_exe()
+        cmd = [exe] if exe else [sys.executable, os.path.abspath(__file__)]
+        env = dict(os.environ)
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        env.pop("_MEIPASS2", None)
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen(cmd, env=env, close_fds=True, creationflags=flags)
+        self._status(T("New window") + " …")
+
+    def open_tests(self):
+        if self.test_win is None:
+            self.test_win = TestRunnerWindow(
+                self.sequences, send=self._send,
+                is_connected=lambda: self.session is not None and self.opened,
+                connection_label=lambda: self.session.label if self.session else "",
+                csv_dir=self._log_dir)
+            self.test_win.destroyed.connect(lambda *_: setattr(self, "test_win", None))
+            self.test_win.setAttribute(Qt.WA_DeleteOnClose, True)
+        self.test_win.show()
+        self.test_win.raise_()
+        self.test_win.activateWindow()
+
+    def open_transfer(self):
+        if self.session is None or not self.opened:
+            QMessageBox.information(self, T("Send file"), T("Not connected — press Connect first"))
+            return
+        TransferDialog(self, self.session).exec()
+
+    def report_problem(self):
+        import platform
+        import urllib.parse
+        crash = os.path.join(user_data_dir(), "crash.log")
+        tail = ""
+        try:
+            with open(crash, "r", encoding="utf-8", errors="replace") as f:
+                tail = "".join(f.readlines()[-30:])
+        except OSError:
+            pass
+        body = (f"**SuperTerm** v{APP_VERSION}\n**Windows** {platform.platform()}\n"
+                f"**Connection** {self.session.label if self.session else '-'}\n\n"
+                "**What happened / steps to reproduce**\n\n\n"
+                + (f"**crash.log (last lines)**\n```\n{tail[-3500:]}\n```\n" if tail else ""))
+        url = (f"https://github.com/{updater.GITHUB_REPO}/issues/new?"
+               + urllib.parse.urlencode({"title": "Problem: ", "body": body}))
+        QDesktopServices.openUrl(QUrl(url))
+
+    def show_about(self):
+        QMessageBox.about(self, T("About SuperTerm"),
+                          f"<b>SuperTerm</b> v{APP_VERSION}<br>Serial · Telnet · SSH · RTSP<br><br>"
+                          f"<a href='https://github.com/{updater.GITHUB_REPO}'>github.com/{updater.GITHUB_REPO}</a>"
+                          f"<br><br>Settings: {user_data_dir()}<br>Logs: {self._log_dir()}")
+
+    def changeEvent(self, ev):
+        # another SuperTerm window may have changed the quick commands
+        if ev.type() == QEvent.ActivationChange and self.isActiveWindow() and hasattr(self, "store"):
+            if self.store.reload_if_changed():
+                self.refresh_quick()
+        super().changeEvent(ev)
 
     # ── updates ──────────────────────────────────────────────────────────────
     UPDATE_EVERY_S = 12 * 3600       # automatic check at most twice a day (GitHub rate limits)
 
     def _auto_check_update(self):
-        if not updater.configured():
+        if not updater.configured() or not self._setting_on("auto_update", "true"):
             return
         try:
             last = float(self.settings.value("update_last_check", 0) or 0)
@@ -1837,18 +2379,23 @@ class MainWindow(QMainWindow):
             self._check_update(manual=False)
 
     def _check_update(self, manual):
+        channel = str(self.settings.value("update_channel", "stable"))
+        if not updater.configured():
+            if manual:
+                QMessageBox.information(self, T("Check for updates"),
+                                        "Automatic updates are not switched on in this build.")
+            return
+
         def work():
             try:
-                self.sig_update.emit(updater.check_latest(), "", manual)
+                self.sig_update.emit(updater.check_latest(channel=channel), "", manual)
             except updater.UpdateError as e:
                 self.sig_update.emit(None, str(e), manual)
         if manual:
-            self.btn_update.setEnabled(False)
-            self.btn_update.setText("Checking…")
+            self._status(T("Check for updates") + " …")
         threading.Thread(target=work, daemon=True).start()
 
     def _on_update_checked(self, info, err, manual):
-        self.btn_update.setEnabled(True)
         if err:
             self._mark_update(None)
             if manual:
@@ -1867,26 +2414,9 @@ class MainWindow(QMainWindow):
 
     def _mark_update(self, info):
         self._update_info = info
+        self.btn_update.setVisible(bool(info))
         if info:
             self.btn_update.setText(f"⬆ Update {info['version']}")
-            self.btn_update.setObjectName("primary")
-        else:
-            self.btn_update.setText("Check updates")
-            self.btn_update.setObjectName("")
-        self.btn_update.style().unpolish(self.btn_update)
-        self.btn_update.style().polish(self.btn_update)
-
-    def update_clicked(self):
-        if not updater.configured():
-            QMessageBox.information(
-                self, "Updates",
-                "Automatic updates are not switched on in this build yet.\n\n"
-                "(Set GITHUB_REPO in updater.py to the GitHub repository and rebuild.)")
-            return
-        if self._update_info:
-            self._show_update()
-        else:
-            self._check_update(manual=True)
 
     def _show_update(self):
         def before_install():
@@ -1906,6 +2436,9 @@ class MainWindow(QMainWindow):
             self.disconnect_session()
         if self.video_win is not None:
             self.video_win.close()
+        if self.test_win is not None:
+            self.test_win.close()
+        self._stop_logfile()
         super().closeEvent(ev)
 
     def open_video(self):
@@ -1932,6 +2465,8 @@ def selftest():
                          "assert s.buffer[0][2].data == 'ที่', s.buffer[0][2]"),
                         ("QtMultimedia", "from PySide6.QtMultimedia import QMediaPlayer"),
                         ("QtMultimediaWidgets", "from PySide6.QtMultimediaWidgets import QVideoWidget"),
+                        ("new modules", "import xmodem, testrunner, logwriter, profiles, panels, i18n; "
+                                        "assert xmodem.crc16(b'123456789') == 0x31C3"),
                         ("CA bundle (updates)", "import certifi, os; assert os.path.getsize(certifi.where()) > 100000; "
                                                 "import updater; updater._ssl_context()"),
                         ("icon asset", "assert __import__('os').path.exists(resource_path('assets/icon.png'))")):
@@ -1974,6 +2509,7 @@ def main():
     if os.path.exists(icon):
         app.setWindowIcon(QIcon(icon))
     install_crash_handler()
+    i18n.set_lang(str(QSettings("SuperTerm", "SuperTerm").value("language", "en")))
     w = MainWindow()
     w.show()
     sys.exit(app.exec())

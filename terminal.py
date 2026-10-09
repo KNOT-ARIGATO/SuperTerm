@@ -139,6 +139,7 @@ class TerminalWidget(QWidget):
         self._blink_on = True
         self.tagger = None                  # text -> "error" / "warn" / "success" / "info"
         self.tag_colors = {}                # tag -> QColor (same colours as the Log view)
+        self._custom_colors = {}            # 'c:#rrggbb' -> QColor (user highlight words)
 
         self._feed_timer = QTimer(self)
         self._feed_timer.setInterval(25)
@@ -190,6 +191,12 @@ class TerminalWidget(QWidget):
         self.tagger = tagger
         self.tag_colors = {k: QColor(v) for k, v in colors.items()}
         self.update()
+
+    def _tag_qcolor(self, tag):
+        c = self._custom_colors.get(tag)
+        if c is None:
+            c = self._custom_colors[tag] = QColor(tag[2:])
+        return c
 
     def _color(self, name, default):
         if name == "default":
@@ -339,7 +346,10 @@ class TerminalWidget(QWidget):
             line_fg = self.c_fg
             if self.tagger is not None:
                 text = "".join((line[x] if x in line else dflt).data for x in range(cols))
-                line_fg = self.tag_colors.get(self.tagger(text), self.c_fg)
+                tag = self.tagger(text)
+                line_fg = self.tag_colors.get(tag)
+                if line_fg is None:
+                    line_fg = self._tag_qcolor(tag) if tag.startswith("c:") else self.c_fg
             x = 0
             while x < cols:
                 ch = line[x] if x in line else dflt
